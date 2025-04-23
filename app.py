@@ -23,7 +23,7 @@ stock_list = [
 ]
 
 # User inputs
-bbw_threshold = st.slider("Select BBW threshold", 0.01, 0.1, 0.05, step=0.005)
+bbw_threshold = st.slider("Select BBW threshold", 0.01, 0.20, 0.05, step=0.005)
 lookback_days = 3
 
 # Helper function to calculate indicators
