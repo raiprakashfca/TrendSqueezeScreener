@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import ta
+import requests
 from kiteconnect import KiteConnect
 from datetime import datetime, timedelta
 from utils.token_utils import load_credentials_from_gsheet
@@ -9,14 +10,29 @@ from utils.zerodha_utils import get_ohlc_15min
 st.set_page_config(page_title="📉 Trend Squeeze Screener", layout="wide")
 st.title("📉 Trend Squeeze Screener (Low BBW after Trend)")
 
-# Load credentials from Google Sheet
-api_key, api_secret, access_token = load_credentials_from_gsheet("ZerodhaTokenStore")
+# Telegram alert function
+def send_telegram_alert(message):
+    try:
+        token = st.secrets["telegram_bot_token"]
+        chat_id = st.secrets["telegram_chat_id"]
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        data = {
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "Markdown"
+        }
+        response = requests.post(url, data=data)
+        if response.status_code != 200:
+            st.warning("⚠️ Telegram alert failed.")
+    except Exception as e:
+        st.warning(f"Telegram error: {e}")
 
-# Initialize Kite Connect client
+# Load credentials
+api_key, api_secret, access_token = load_credentials_from_gsheet("ZerodhaTokenStore")
 kite = KiteConnect(api_key=api_key)
 kite.set_access_token(access_token)
 
-# Stock universe (can be expanded)
+# NIFTY 100 Stock list (updated)
 stock_list = [
     "ADANIENT", "ADANIGREEN", "ADANIPORTS", "AMBUJACEM", "APOLLOHOSP", "ASIANPAINT", "AXISBANK", "BAJAJ-AUTO",
     "BAJAJFINSV", "BAJFINANCE", "BAJAJHLDNG", "BANDHANBNK", "BANKBARODA", "BERGEPAINT", "BHARTIARTL", "BHEL",
@@ -32,12 +48,11 @@ stock_list = [
     "TRENT", "TVSMOTOR", "UBL", "ULTRACEMCO", "UPL", "VEDL", "VOLTAS", "WIPRO", "ZEEL"
 ]
 
-
-# User inputs
+# Inputs
 bbw_threshold = st.slider("Select BBW threshold", 0.01, 0.20, 0.05, step=0.005)
 lookback_days = 3
 
-# Helper function to calculate indicators
+# Indicator calculator
 def calculate_indicators(df):
     df = df.copy()
     df['ema50'] = ta.trend.ema_indicator(df['close'], window=50)
@@ -49,9 +64,9 @@ def calculate_indicators(df):
     df['bbw'] = (bb.bollinger_hband() - bb.bollinger_lband()) / bb.bollinger_mavg()
     return df
 
-# Main logic
+# Screener logic
 screener_data = []
-st.info("Fetching and analyzing data. This may take a minute...")
+st.info("📊 Fetching and analyzing NIFTY 100 stocks. Please wait...")
 
 for symbol in stock_list:
     try:
@@ -71,6 +86,19 @@ for symbol in stock_list:
                 setup = "Bearish Squeeze"
 
             if setup:
+                # Trigger Telegram alert
+                message = f"""
+📉 *Trend Squeeze Detected!*
+
+*Symbol:* {symbol}
+*Setup:* {setup}
+*BBW:* {latest['bbw']:.4f}
+*RSI:* {latest['rsi']:.1f}
+*ADX:* {latest['adx']:.1f}
+🕒 {datetime.now().strftime('%d %b %Y • %H:%M:%S')}
+"""
+                send_telegram_alert(message)
+
                 screener_data.append({
                     "Symbol": symbol,
                     "LTP": round(latest['close'], 2),
@@ -83,10 +111,10 @@ for symbol in stock_list:
     except Exception as e:
         st.warning(f"{symbol}: Failed to fetch or compute — {str(e)}")
 
-# Display results
+# Display final table
 if screener_data:
     df_out = pd.DataFrame(screener_data)
-    st.success(f"{len(df_out)} stocks found matching criteria")
+    st.success(f"✅ {len(df_out)} stocks matched the squeeze criteria.")
     st.dataframe(df_out, use_container_width=True)
 else:
     st.info("No stocks currently match the squeeze criteria.")
