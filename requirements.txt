@@ -1,0 +1,7 @@
+streamlit
+pandas
+ta
+kiteconnect
+gspread
+oauth2client
+openpyxl
