@@ -10,6 +10,12 @@ from utils.zerodha_utils import get_ohlc_15min
 st.set_page_config(page_title="📉 Trend Squeeze Screener", layout="wide")
 st.title("📉 Trend Squeeze Screener (Low BBW after Trend)")
 
+# 🔁 Auto-refresh every 5 minutes (300 seconds)
+st_autorefresh = st.experimental_memo(ttl=300)(lambda: True)
+st_autorefresh()
+with st.sidebar:
+    st.info("⏳ Auto-refresh every 5 minutes enabled")
+
 # Telegram alert function
 def send_telegram_alert(message):
     try:
