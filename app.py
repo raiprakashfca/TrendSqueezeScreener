@@ -7,75 +7,75 @@ from utils.token_utils import load_credentials_from_gsheet
 from utils.zerodha_utils import get_ohlc_15min
 
 st.set_page_config(page_title="📉 Trend Squeeze Screener", layout="wide")
-st.title("📉 Trend Squeeze Screener")
+st.title("📉 Trend Squeeze Screener (Low BBW after Trend)")
 
-# Load Zerodha credentials
-creds = load_credentials_from_gsheet("ZerodhaTokenStore")
-kite = KiteConnect(api_key=creds["api_key"])
-kite.set_access_token(creds["access_token"])
+# Load credentials from Google Sheet
+api_key, api_secret, access_token = load_credentials_from_gsheet("ZerodhaTokenStore")
 
-# Select stock universe
-nifty_100 = [  # sample; replace with full list or fetch dynamically
-    "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "SBIN", "KOTAKBANK", "LT",
-    "AXISBANK", "ITC", "HINDUNILVR", "BAJFINANCE"
+# Initialize Kite Connect client
+kite = KiteConnect(api_key=api_key)
+kite.set_access_token(access_token)
+
+# Stock universe (can be expanded)
+stock_list = [
+    "RELIANCE", "INFY", "TCS", "HDFCBANK", "ICICIBANK", "SBIN", "LT", "AXISBANK", "HINDUNILVR",
+    "KOTAKBANK", "ITC", "TITAN", "SUNPHARMA", "MARUTI", "WIPRO", "TECHM", "BAJFINANCE", "ADANIENT"
 ]
 
-st.sidebar.header("🔍 Screener Settings")
-bbw_threshold = st.sidebar.slider("Bollinger Bandwidth <", 0.01, 0.1, 0.05, 0.005)
-lookback_days = st.sidebar.slider("Trend Detection Lookback (days)", 10, 60, 30)
-universe = st.sidebar.multiselect("Select Stocks", options=nifty_100, default=nifty_100)
+# User inputs
+bbw_threshold = st.slider("Select BBW threshold", 0.01, 0.1, 0.05, step=0.005)
+lookback_days = 3
 
-@st.cache_data(show_spinner=False)
-def analyze_stock(symbol):
+# Helper function to calculate indicators
+def calculate_indicators(df):
+    df = df.copy()
+    df['ema50'] = ta.trend.ema_indicator(df['close'], window=50)
+    df['ema200'] = ta.trend.ema_indicator(df['close'], window=200)
+    df['rsi'] = ta.momentum.rsi(df['close'], window=14)
+    adx = ta.trend.adx(df['high'], df['low'], df['close'], window=14)
+    df['adx'] = adx
+    bb = ta.volatility.BollingerBands(df['close'], window=20)
+    df['bbw'] = (bb.bollinger_hband() - bb.bollinger_lband()) / bb.bollinger_mavg()
+    return df
+
+# Main logic
+screener_data = []
+st.info("Fetching and analyzing data. This may take a minute...")
+
+for symbol in stock_list:
     try:
-        token = get_instrument_token(kite, symbol)
-        from_date = datetime.now() - timedelta(days=3)
-        to_date = datetime.now()
-        df = fetch_historical_data(kite, token, "15minute", from_date, to_date)
+        df = get_ohlc_15min(kite, symbol, days=lookback_days)
+        df = calculate_indicators(df)
+        latest = df.iloc[-1]
 
-        df.dropna(inplace=True)
-        df.ta.ema(length=50, append=True)
-        df.ta.ema(length=200, append=True)
-        df.ta.rsi(length=14, append=True)
-        adx = df.ta.adx(length=14)
-        df = pd.concat([df, adx], axis=1)
-        bbands = df.ta.bbands(length=20, append=True)
-        df = pd.concat([df, bbands], axis=1)
-        df["BBW"] = (df["BBU_20_2.0"] - df["BBL_20_2.0"]) / df["BBM_20_2.0"]
+        trend = ""
+        setup = ""
 
-        last = df.iloc[-1]
-
-        trend = None
-        setup = None
-
-        if last["EMA_50"] > last["EMA_200"] and last["RSI_14"] > 60 and last["ADX_14"] > 20:
-            trend = "Uptrend"
-            if last["BBW"] < bbw_threshold:
+        if latest['bbw'] < bbw_threshold:
+            if latest['close'] > latest['ema50'] > latest['ema200'] and latest['rsi'] > 60 and latest['adx'] > 20:
+                trend = "Uptrend"
                 setup = "Bullish Squeeze"
-        elif last["EMA_50"] < last["EMA_200"] and last["RSI_14"] < 40 and last["ADX_14"] > 20:
-            trend = "Downtrend"
-            if last["BBW"] < bbw_threshold:
+            elif latest['close'] < latest['ema50'] < latest['ema200'] and latest['rsi'] < 40 and latest['adx'] > 20:
+                trend = "Downtrend"
                 setup = "Bearish Squeeze"
 
-        return {
-            "Symbol": symbol,
-            "LTP": round(last["close"], 2),
-            "BBW": round(last["BBW"], 4),
-            "RSI": round(last["RSI_14"], 2),
-            "ADX": round(last["ADX_14"], 2),
-            "Trend": trend,
-            "Setup": setup
-        }
+            if setup:
+                screener_data.append({
+                    "Symbol": symbol,
+                    "LTP": round(latest['close'], 2),
+                    "BBW": round(latest['bbw'], 4),
+                    "RSI": round(latest['rsi'], 1),
+                    "ADX": round(latest['adx'], 1),
+                    "Trend": trend,
+                    "Setup": setup
+                })
     except Exception as e:
-        return {"Symbol": symbol, "Error": str(e)}
+        st.warning(f"{symbol}: Failed to fetch or compute — {str(e)}")
 
-st.info("Running analysis across selected stocks...")
-results = [analyze_stock(symbol) for symbol in universe]
-df_out = pd.DataFrame(results)
-df_out = df_out[df_out["Setup"].notnull()]
-
-st.subheader("📊 Matching Stocks")
-st.dataframe(df_out, use_container_width=True)
-
-csv = df_out.to_csv(index=False)
-st.download_button("📥 Download Results as CSV", csv, "squeeze_stocks.csv")
+# Display results
+if screener_data:
+    df_out = pd.DataFrame(screener_data)
+    st.success(f"{len(df_out)} stocks found matching criteria")
+    st.dataframe(df_out, use_container_width=True)
+else:
+    st.info("No stocks currently match the squeeze criteria.")
