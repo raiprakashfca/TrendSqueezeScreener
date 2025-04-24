@@ -1,9 +1,8 @@
 streamlit
 pandas
-ta
-kiteconnect
-gspread
-oauth2client
-openpyxl
 matplotlib
 pandas-ta
+kiteconnect
+gspread
+google-auth
+fpdf
