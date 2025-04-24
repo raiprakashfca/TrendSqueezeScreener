@@ -4,14 +4,16 @@ import ta
 import requests
 from kiteconnect import KiteConnect
 from datetime import datetime, timedelta
-from streamlit_autorefresh import st_autorefresh  # ✅ NEW import
+from streamlit_autorefresh import st_autorefresh
 from utils.token_utils import load_credentials_from_gsheet
 from utils.zerodha_utils import get_ohlc_15min
+
+# ✅ MUST BE FIRST Streamlit call
+st.set_page_config(page_title="📉 Trend Squeeze Screener", layout="wide")
 
 # 🔁 Auto-refresh every 5 minutes
 st_autorefresh(interval=300000, key="auto_refresh")
 
-st.set_page_config(page_title="📉 Trend Squeeze Screener", layout="wide")
 st.title("📉 Trend Squeeze Screener (Low BBW after Trend)")
 st.info("⏳ Auto-refresh every 5 minutes is enabled")
 
