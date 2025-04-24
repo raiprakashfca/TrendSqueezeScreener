@@ -6,4 +6,4 @@ kiteconnect
 gspread
 google-auth
 fpdf
-numpy
+numpy==1.24.4
