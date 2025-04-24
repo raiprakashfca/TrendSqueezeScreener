@@ -1,9 +1,9 @@
 streamlit
 pandas
 matplotlib
-pandas-ta
+git+https://github.com/openai/pandas-ta@nan-fix
 kiteconnect
 gspread
 google-auth
 fpdf
-numpy==1.24.4
+numpy>=1.26.0
