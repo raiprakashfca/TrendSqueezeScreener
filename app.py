@@ -4,11 +4,12 @@ import ta
 import requests
 from kiteconnect import KiteConnect
 from datetime import datetime, timedelta
+from streamlit_autorefresh import st_autorefresh  # ✅ NEW import
 from utils.token_utils import load_credentials_from_gsheet
 from utils.zerodha_utils import get_ohlc_15min
 
 # 🔁 Auto-refresh every 5 minutes
-st.experimental_memo(ttl=300)(lambda: True)()
+st_autorefresh(interval=300000, key="auto_refresh")
 
 st.set_page_config(page_title="📉 Trend Squeeze Screener", layout="wide")
 st.title("📉 Trend Squeeze Screener (Low BBW after Trend)")
