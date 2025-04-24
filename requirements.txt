@@ -5,3 +5,4 @@ kiteconnect
 gspread
 oauth2client
 openpyxl
+matplotlib
