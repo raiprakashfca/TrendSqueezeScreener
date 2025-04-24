@@ -6,6 +6,7 @@ gspread
 oauth2client
 openpyxl
 requests
+streamlit-autorefresh
 
 # Optional charting
 matplotlib
