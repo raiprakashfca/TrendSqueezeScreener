@@ -1,31 +1,18 @@
 import streamlit as st
 import pandas as pd
-import gspread
-from google.oauth2.service_account import Credentials
+import ta
+import requests
 from kiteconnect import KiteConnect
-from datetime import datetime
-import matplotlib.pyplot as plt
-import pandas_ta as ta
-from fpdf import FPDF
-import base64
-import os
-import time
+from datetime import datetime, timedelta
+from utils.token_utils import load_credentials_from_gsheet
+from utils.zerodha_utils import get_ohlc_15min
 
-# ------------------ AUTO-REFRESH EVERY 5 MINUTES ------------------
-if "last_refresh" not in st.session_state:
-    st.session_state.last_refresh = time.time()
+# 🔁 Auto-refresh every 5 minutes
+st.experimental_memo(ttl=300)(lambda: True)()
 
-if time.time() - st.session_state.last_refresh > 300:
-    st.session_state.last_refresh = time.time()
-    st.experimental_rerun()
-
-# ------------------ SIDEBAR ------------------
-with st.sidebar:
-    st.info("⏳ Auto-refresh every 5 minutes enabled")
-
-# ------------------ MAIN APP CONTENT ------------------
-
-st.title("📊 Trend Squeeze Screener")
+st.set_page_config(page_title="📉 Trend Squeeze Screener", layout="wide")
+st.title("📉 Trend Squeeze Screener (Low BBW after Trend)")
+st.info("⏳ Auto-refresh every 5 minutes is enabled")
 
 # Telegram alert function
 def send_telegram_alert(message):
@@ -49,7 +36,7 @@ api_key, api_secret, access_token = load_credentials_from_gsheet("ZerodhaTokenSt
 kite = KiteConnect(api_key=api_key)
 kite.set_access_token(access_token)
 
-# NIFTY 100 Stock list (updated)
+# NIFTY 100 stock list
 stock_list = [
     "ADANIENT", "ADANIGREEN", "ADANIPORTS", "AMBUJACEM", "APOLLOHOSP", "ASIANPAINT", "AXISBANK", "BAJAJ-AUTO",
     "BAJAJFINSV", "BAJFINANCE", "BAJAJHLDNG", "BANDHANBNK", "BANKBARODA", "BERGEPAINT", "BHARTIARTL", "BHEL",
@@ -65,7 +52,7 @@ stock_list = [
     "TRENT", "TVSMOTOR", "UBL", "ULTRACEMCO", "UPL", "VEDL", "VOLTAS", "WIPRO", "ZEEL"
 ]
 
-# Inputs
+# UI inputs
 bbw_threshold = st.slider("Select BBW threshold", 0.01, 0.20, 0.05, step=0.005)
 lookback_days = 3
 
@@ -81,7 +68,7 @@ def calculate_indicators(df):
     df['bbw'] = (bb.bollinger_hband() - bb.bollinger_lband()) / bb.bollinger_mavg()
     return df
 
-# Screener logic
+# Main logic
 screener_data = []
 st.info("📊 Fetching and analyzing NIFTY 100 stocks. Please wait...")
 
@@ -103,7 +90,6 @@ for symbol in stock_list:
                 setup = "Bearish Squeeze"
 
             if setup:
-                # Trigger Telegram alert
                 message = f"""
 📉 *Trend Squeeze Detected!*
 
@@ -128,7 +114,7 @@ for symbol in stock_list:
     except Exception as e:
         st.warning(f"{symbol}: Failed to fetch or compute — {str(e)}")
 
-# Display final table
+# Display table
 if screener_data:
     df_out = pd.DataFrame(screener_data)
     st.success(f"✅ {len(df_out)} stocks matched the squeeze criteria.")
