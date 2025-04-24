@@ -1,9 +1,19 @@
 streamlit
 pandas
-matplotlib
-git+https://github.com/mayankjha10/pandas-ta.git
+ta
 kiteconnect
 gspread
-google-auth
+oauth2client
+openpyxl
+requests
+
+# Charting
+matplotlib
+plotly
+
+# PDF generation
 fpdf
-numpy>=1.26.0
+pdfkit
+
+# Enhanced Streamlit UI components
+streamlit-option-menu
