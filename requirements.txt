@@ -6,3 +6,4 @@ kiteconnect
 gspread
 google-auth
 fpdf
+numpy
