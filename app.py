@@ -1,19 +1,31 @@
 import streamlit as st
 import pandas as pd
-import ta
-import requests
+import gspread
+from google.oauth2.service_account import Credentials
 from kiteconnect import KiteConnect
-from datetime import datetime, timedelta
-from utils.token_utils import load_credentials_from_gsheet
-from utils.zerodha_utils import get_ohlc_15min
+from datetime import datetime
+import matplotlib.pyplot as plt
+import pandas_ta as ta
+from fpdf import FPDF
+import base64
+import os
+import time
 
-st.set_page_config(page_title="📉 Trend Squeeze Screener", layout="wide")
-st.title("📉 Trend Squeeze Screener (Low BBW after Trend)")
-st.info("⏳ Auto-refresh every 5 minutes is enabled")
+# ------------------ AUTO-REFRESH EVERY 5 MINUTES ------------------
+if "last_refresh" not in st.session_state:
+    st.session_state.last_refresh = time.time()
 
-# 🔁 Auto-refresh every 5 minutes (300 seconds)
-st_autorefresh = st.experimental_memo(ttl=300)(lambda: True)
-st_autorefresh()
+if time.time() - st.session_state.last_refresh > 300:
+    st.session_state.last_refresh = time.time()
+    st.experimental_rerun()
+
+# ------------------ SIDEBAR ------------------
+with st.sidebar:
+    st.info("⏳ Auto-refresh every 5 minutes enabled")
+
+# ------------------ MAIN APP CONTENT ------------------
+
+st.title("📊 Trend Squeeze Screener")
 
 # Telegram alert function
 def send_telegram_alert(message):
