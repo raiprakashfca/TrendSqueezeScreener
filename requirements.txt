@@ -6,14 +6,14 @@ gspread
 oauth2client
 openpyxl
 requests
-pandas-ta
-# Charting
+
+# Optional charting
 matplotlib
 plotly
 
-# PDF generation
+# Optional PDF generation
 fpdf
 pdfkit
 
-# Enhanced Streamlit UI components
+# Optional UI enhancements
 streamlit-option-menu
