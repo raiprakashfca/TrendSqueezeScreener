@@ -6,7 +6,7 @@ gspread
 oauth2client
 openpyxl
 requests
-
+pandas-ta
 # Charting
 matplotlib
 plotly
