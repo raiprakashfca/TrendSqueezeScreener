@@ -57,7 +57,6 @@ stock_list = [
 
 # UI inputs
 bbw_threshold = st.slider("Select BBW threshold", 0.01, 0.20, 0.05, step=0.005)
-lookback_days = 3
 
 # Indicator calculator
 def calculate_indicators(df):
@@ -77,7 +76,12 @@ st.info("📊 Fetching and analyzing NIFTY 100 stocks. Please wait...")
 
 for symbol in stock_list:
     try:
-        df = get_ohlc_15min(kite, symbol, days=lookback_days)
+        df = get_ohlc_15min(kite, symbol)
+
+        if df is None or df.shape[0] < 10:
+            st.warning(f"{symbol}: Not enough data to compute indicators, skipping.")
+            continue
+
         df = calculate_indicators(df)
         latest = df.iloc[-1]
 
