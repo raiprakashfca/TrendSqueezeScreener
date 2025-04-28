@@ -55,7 +55,7 @@ stock_list = [
     "TRENT", "TVSMOTOR", "UBL", "ULTRACEMCO", "UPL", "VEDL", "VOLTAS", "WIPRO", "ZEEL"
 ]
 
-# UI inputs
+# UI input
 bbw_threshold = st.slider("Select BBW threshold", 0.01, 0.20, 0.05, step=0.005)
 
 # Indicator calculator
@@ -64,8 +64,7 @@ def calculate_indicators(df):
     df['ema50'] = ta.trend.ema_indicator(df['close'], window=50)
     df['ema200'] = ta.trend.ema_indicator(df['close'], window=200)
     df['rsi'] = ta.momentum.rsi(df['close'], window=14)
-    adx = ta.trend.adx(df['high'], df['low'], df['close'], window=14)
-    df['adx'] = adx
+    df['adx'] = ta.trend.adx(df['high'], df['low'], df['close'], window=14)
     bb = ta.volatility.BollingerBands(df['close'], window=20)
     df['bbw'] = (bb.bollinger_hband() - bb.bollinger_lband()) / bb.bollinger_mavg()
     return df
@@ -78,11 +77,16 @@ for symbol in stock_list:
     try:
         df = get_ohlc_15min(kite, symbol)
 
-        if df is None or df.shape[0] < 10:
-            st.warning(f"{symbol}: Not enough data to compute indicators, skipping.")
+        if df is None or df.shape[0] < 60:
+            st.warning(f"{symbol}: Only {df.shape[0]} candles available — skipping insufficient data.")
             continue
 
         df = calculate_indicators(df)
+
+        if df.isnull().values.any():
+            st.warning(f"{symbol}: Indicators contain NaNs — skipping.")
+            continue
+
         latest = df.iloc[-1]
 
         trend = ""
