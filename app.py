@@ -3,7 +3,7 @@ import pandas as pd
 import ta
 import requests
 from kiteconnect import KiteConnect
-from datetime import datetime, timedelta
+from datetime import datetime
 from streamlit_autorefresh import st_autorefresh
 from utils.token_utils import load_credentials_from_gsheet
 from utils.zerodha_utils import get_ohlc_15min
@@ -55,7 +55,7 @@ stock_list = [
     "TRENT", "TVSMOTOR", "UBL", "ULTRACEMCO", "UPL", "VEDL", "VOLTAS", "WIPRO", "ZEEL"
 ]
 
-# UI input
+# BBW input
 bbw_threshold = st.slider("Select BBW threshold", 0.01, 0.20, 0.05, step=0.005)
 
 # Indicator calculator
@@ -78,7 +78,7 @@ for symbol in stock_list:
         df = get_ohlc_15min(kite, symbol)
 
         if df is None or df.shape[0] < 60:
-            st.warning(f"{symbol}: Only {df.shape[0]} candles available — skipping insufficient data.")
+            st.warning(f"{symbol}: Only {df.shape[0]} candles after fallback — skipping.")
             continue
 
         df = calculate_indicators(df)
