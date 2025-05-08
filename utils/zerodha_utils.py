@@ -52,22 +52,35 @@ def fetch_ohlc_for_date(kite, symbol, date_obj):
 def get_ohlc_15min(kite, symbol):
     today = datetime.now().date()
 
-    # Try today's intraday data first
-    df_today = fetch_ohlc_for_date(kite, symbol, today)
-    if df_today is not None and df_today.shape[0] >= 60:
+    def fetch_valid(symbol, date_obj):
+        df = fetch_ohlc_for_date(kite, symbol, date_obj)
+        if df is not None and df.shape[0] >= 30:
+            return df
+        return None
+
+    # Try today
+    df_today = fetch_valid(symbol, today)
+    if df_today is not None:
         st.info(f"{symbol}: ✅ Using today’s candles ({df_today.shape[0]})")
         return df_today
     else:
-        msg = f"{symbol}: ⚠️ Only {df_today.shape[0] if df_today is not None else 0} candles today — falling back"
-        st.warning(msg)
+        st.warning(f"{symbol}: ⚠️ Today's candles insufficient — trying fallback 1...")
 
-    # Fallback to last trading day
-    last_day = get_last_trading_day(today, skip_today_if_trading=True)
-    df_prev = fetch_ohlc_for_date(kite, symbol, last_day)
+    # Fallback 1: previous trading day
+    fallback_1 = get_last_trading_day(today, skip_today_if_trading=True)
+    df_prev = fetch_valid(symbol, fallback_1)
+    if df_prev is not None:
+        st.info(f"{symbol}: 🔁 Using fallback from {fallback_1} ({df_prev.shape[0]})")
+        return df_prev
 
-    if df_prev is not None and df_prev.shape[0] >= 60:
-        st.info(f"{symbol}: 🔁 Fallback to {last_day} worked ({df_prev.shape[0]} candles)")
-    else:
-        st.warning(f"{symbol}: 🚫 Fallback to {last_day} also insufficient ({df_prev.shape[0] if df_prev is not None else 0})")
+    # Fallback 2: 2 days ago
+    fallback_2 = get_last_trading_day(fallback_1)
+    df_prev2 = fetch_valid(symbol, fallback_2)
+    if df_prev2 is not None:
+        st.info(f"{symbol}: 🔁🔁 Using 2nd fallback from {fallback_2} ({df_prev2.shape[0]})")
+        return df_prev2
 
-    return df_prev
+    # Give up
+    st.warning(f"{symbol}: ❌ Even 2-day fallback failed — skipping.")
+    return pd.DataFrame()
+
