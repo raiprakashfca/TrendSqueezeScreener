@@ -1,9 +1,12 @@
-import streamlit as st
-import pandas as pd
-from kiteconnect import KiteConnect
+import io
 from datetime import datetime, time
-from streamlit_autorefresh import st_autorefresh
 from zoneinfo import ZoneInfo
+
+import pandas as pd
+import requests
+import streamlit as st
+from kiteconnect import KiteConnect
+from streamlit_autorefresh import st_autorefresh
 
 from utils.token_utils import load_credentials_from_gsheet
 from utils.zerodha_utils import (
@@ -29,6 +32,70 @@ def market_open_now() -> bool:
     return is_trading_day(now.date()) and MARKET_OPEN <= now.time() <= MARKET_CLOSE
 
 
+def fetch_nifty50_symbols() -> list[str] | None:
+    """
+    Fetch the latest NIFTY 50 constituents from NSE's official CSV.
+
+    Returns a list of SYMBOL strings (e.g. ['RELIANCE', 'HDFCBANK', ...])
+    or None on failure.
+
+    Uses a browser-like User-Agent and Referer to reduce chances of NSE blocking.
+    """
+    nifty50_csv_url = "https://nsearchives.nseindia.com/content/indices/ind_nifty50list.csv"
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0 Safari/537.36"
+        ),
+        "Referer": "https://www.nseindia.com/",
+        "Accept": "text/csv,application/vnd.ms-excel,application/octet-stream;q=0.9,*/*;q=0.8",
+    }
+
+    try:
+        resp = requests.get(nifty50_csv_url, headers=headers, timeout=10)
+        resp.raise_for_status()
+    except Exception as e:
+        st.warning(f"Failed to download NIFTY 50 CSV from NSE: {e}")
+        return None
+
+    try:
+        df = pd.read_csv(io.StringIO(resp.text))
+    except Exception as e:
+        st.warning(f"Failed to parse NIFTY 50 CSV: {e}")
+        return None
+
+    if "Symbol" not in df.columns:
+        st.warning("NSE NIFTY 50 CSV does not contain 'Symbol' column. Format may have changed.")
+        return None
+
+    symbols = (
+        df["Symbol"]
+        .astype(str)
+        .str.strip()
+        .dropna()
+        .unique()
+        .tolist()
+    )
+
+    # Sort for stability
+    symbols = sorted(symbols)
+
+    if len(symbols) != 50:
+        st.warning(
+            f"Expected 50 NIFTY symbols, got {len(symbols)}. "
+            "Proceeding, but please verify against NSE manually."
+        )
+
+    # 🔁 Post-demerger fix:
+    # If NSE still shows TATAMOTORS but you trade TMPV, map it.
+    if "TATAMOTORS" in symbols and "TMPV" not in symbols:
+        symbols = ["TMPV" if s == "TATAMOTORS" else s for s in symbols]
+
+    return symbols
+
+
 st.title("📉 Trend Squeeze Screener (Low BBW after Trend)")
 st.info("⏳ Auto-refresh every 5 minutes is enabled")
 
@@ -38,35 +105,84 @@ mode_str = (
     if market_open_now()
     else "🔵 EOD / OFF-MARKET (using last trading session data)"
 )
-st.caption(
-    f"{mode_str} • Last refresh: {now_ist.strftime('%d %b %Y • %H:%M:%S')} IST"
-)
+st.caption(f"{mode_str} • Last refresh: {now_ist.strftime('%d %b %Y • %H:%M:%S')} IST")
 
-# Load Zerodha credentials
-api_key, api_secret, access_token = load_credentials_from_gsheet(
-    "ZerodhaTokenStore"
-)
+# -----------------------------
+# 🔐 Zerodha credentials
+# -----------------------------
+api_key, api_secret, access_token = load_credentials_from_gsheet("ZerodhaTokenStore")
 kite = KiteConnect(api_key=api_key)
 kite.set_access_token(access_token)
 
-# NIFTY 100 stock list (unchanged)
-stock_list = [
-    "ADANIENT", "ADANIGREEN", "ADANIPORTS", "AMBUJACEM", "APOLLOHOSP", "ASIANPAINT", "AXISBANK", "BAJAJ-AUTO",
-    "BAJAJFINSV", "BAJFINANCE", "BAJAJHLDNG", "BANDHANBNK", "BANKBARODA", "BERGEPAINT", "BHARTIARTL", "BHEL",
-    "BIOCON", "BPCL", "BRITANNIA", "CHOLAFIN", "CIPLA", "COALINDIA", "COLPAL", "DABUR", "DIVISLAB", "DLF",
-    "DRREDDY", "EICHERMOT", "ESCORTS", "EXIDEIND", "FEDERALBNK", "GAIL", "GLAND", "GLAXO", "GODREJCP", "GRASIM",
-    "HAVELLS", "HCLTECH", "HDFCBANK", "HDFCAMC", "HDFCLIFE", "HEROMOTOCO", "HINDALCO", "HINDPETRO", "HINDUNILVR",
-    "ICICIBANK", "ICICIGI", "ICICIPRULI", "IDFCFIRSTB", "IGL", "INDIGO", "INDUSINDBK", "INDUSTOWER", "INFY",
-    "IOC", "IRCTC", "ITC", "JINDALSTEL", "JSWSTEEL", "JUBLFOOD", "KOTAKBANK", "LICI", "LT", "LTIM", "LTTS",
-    "LUPIN", "M&M", "M&MFIN", "MANAPPURAM", "MARICO", "MARUTI", "MPHASIS", "MRF", "MUTHOOTFIN", "NESTLEIND",
-    "NTPC", "OBEROIRLTY", "ONGC", "PAGEIND", "PEL", "PETRONET", "PFC", "PIDILITIND", "PIIND", "PNB", "POWERGRID",
-    "RECLTD", "RELIANCE", "SAIL", "SBICARD", "SBILIFE", "SBIN", "SHREECEM", "SIEMENS", "SRF", "SUNPHARMA",
-    "TATACHEM", "TATACONSUM", "TATAMOTORS", "TATAPOWER", "TATASTEEL", "TCS", "TECHM", "TITAN", "TORNTPHARM",
-    "TRENT", "TVSMOTOR", "UBL", "ULTRACEMCO", "UPL", "VEDL", "VOLTAS", "WIPRO", "ZEEL",
+# -----------------------------
+# 📈 NIFTY 50 stock universe
+# -----------------------------
+
+# Fallback list in case NSE CSV fetch fails
+fallback_nifty50 = [
+    "ADANIENT",
+    "ADANIPORTS",
+    "APOLLOHOSP",
+    "ASIANPAINT",
+    "AXISBANK",
+    "BAJAJ-AUTO",
+    "BAJFINANCE",
+    "BAJAJFINSV",
+    "BHARTIARTL",
+    "BPCL",
+    "BRITANNIA",
+    "CIPLA",
+    "COALINDIA",
+    "DIVISLAB",
+    "DRREDDY",
+    "EICHERMOT",
+    "GRASIM",
+    "HCLTECH",
+    "HDFCBANK",
+    "HINDALCO",
+    "HINDUNILVR",
+    "ICICIBANK",
+    "INDUSINDBK",
+    "INFY",
+    "ITC",
+    "JSWSTEEL",
+    "KOTAKBANK",
+    "LT",
+    "LTIM",
+    "M&M",
+    "MARUTI",
+    "NESTLEIND",
+    "NTPC",
+    "ONGC",
+    "POWERGRID",
+    "RELIANCE",
+    "SBIN",
+    "SBILIFE",
+    "SUNPHARMA",
+    "TATACONSUM",
+    "TMPV",  # Tata Motors Passenger Vehicles (post-demerger symbol)
+    "TATASTEEL",
+    "TCS",
+    "TECHM",
+    "TITAN",
+    "ULTRACEMCO",
+    "UPL",
+    "WIPRO",
+    "HEROMOTOCO",
+    "SHREECEM",
 ]
 
-# --- Squeeze configuration ---
+live_nifty50 = fetch_nifty50_symbols()
+if live_nifty50:
+    stock_list = live_nifty50
+    st.caption(f"Universe: Latest NIFTY 50 from NSE (fetched {len(stock_list)} symbols).")
+else:
+    stock_list = fallback_nifty50
+    st.caption("Universe: Fallback hard-coded NIFTY 50 list (NSE CSV unavailable).")
 
+# -----------------------------
+# 🎯 Squeeze configuration
+# -----------------------------
 col1, col2 = st.columns(2)
 with col1:
     bbw_abs_threshold = st.slider(
@@ -92,12 +208,16 @@ st.caption(
     "threshold and the rolling percentile threshold."
 )
 
-# Build instrument token map once per run (API efficient)
+# -----------------------------
+# 🧩 Instrument tokens (API efficient)
+# -----------------------------
 instrument_token_map = build_instrument_token_map(kite, stock_list)
 
-# Main logic
-screener_data = []
-st.info("📊 Fetching and analyzing NIFTY 100 stocks. Please wait...")
+# -----------------------------
+# 🔍 Main screening loop
+# -----------------------------
+screener_data: list[dict] = []
+st.info("📊 Fetching and analyzing NIFTY 50 stocks. Please wait...")
 
 for symbol in stock_list:
     token = instrument_token_map.get(symbol)
@@ -144,7 +264,9 @@ for symbol in stock_list:
     except Exception as e:
         st.warning(f"{symbol}: Failed to fetch or compute — {str(e)}")
 
-# Display table
+# -----------------------------
+# 📋 Output
+# -----------------------------
 if screener_data:
     df_out = pd.DataFrame(screener_data)
     st.success(f"✅ {len(df_out)} stocks matched the Trend Squeeze criteria.")
