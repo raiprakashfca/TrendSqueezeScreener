@@ -2,6 +2,7 @@ import io
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
@@ -19,7 +20,7 @@ from utils.strategy import prepare_trend_squeeze
 # ✅ MUST BE FIRST Streamlit call
 st.set_page_config(page_title="📉 Trend Squeeze Screener", layout="wide")
 
-# 🔁 Auto-refresh every 5 minutes (only really useful for Live tab)
+# 🔁 Auto-refresh every 5 minutes (for Live tab)
 st_autorefresh(interval=300000, key="auto_refresh")
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -94,39 +95,162 @@ def fetch_nifty50_symbols() -> list[str] | None:
     return symbols
 
 
+def format_ts(ts: pd.Timestamp) -> str:
+    """Format timestamps nicely, without timezone noise."""
+    if isinstance(ts, pd.Timestamp):
+        try:
+            if ts.tzinfo is not None:
+                ts = ts.tz_convert("Asia/Kolkata")
+        except Exception:
+            pass
+        return ts.strftime("%d-%b-%Y %H:%M")
+    return str(ts)
+
+
+def compute_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0) -> pd.DataFrame:
+    """
+    Compute Supertrend (classic ATR-based) and return df with:
+        - 'supertrend': line value
+        - 'st_dir': +1 for bullish, -1 for bearish
+    """
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+
+    hl2 = (high + low) / 2.0
+
+    prev_close = close.shift(1)
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    atr = tr.rolling(period).mean()
+
+    basic_ub = hl2 + multiplier * atr
+    basic_lb = hl2 - multiplier * atr
+
+    final_ub = basic_ub.copy()
+    final_lb = basic_lb.copy()
+
+    for i in range(1, len(df)):
+        if basic_ub.iloc[i] < final_ub.iloc[i - 1] or close.iloc[i - 1] > final_ub.iloc[i - 1]:
+            final_ub.iloc[i] = basic_ub.iloc[i]
+        else:
+            final_ub.iloc[i] = final_ub.iloc[i - 1]
+
+        if basic_lb.iloc[i] > final_lb.iloc[i - 1] or close.iloc[i - 1] < final_lb.iloc[i - 1]:
+            final_lb.iloc[i] = basic_lb.iloc[i]
+        else:
+            final_lb.iloc[i] = final_lb.iloc[i - 1]
+
+    supertrend = pd.Series(index=df.index, dtype=float)
+    direction = pd.Series(index=df.index, dtype=int)
+
+    for i in range(len(df)):
+        if i == 0:
+            supertrend.iloc[i] = final_ub.iloc[i]
+            direction.iloc[i] = -1
+        else:
+            if supertrend.iloc[i - 1] == final_ub.iloc[i - 1]:
+                if close.iloc[i] <= final_ub.iloc[i]:
+                    supertrend.iloc[i] = final_ub.iloc[i]
+                    direction.iloc[i] = -1
+                else:
+                    supertrend.iloc[i] = final_lb.iloc[i]
+                    direction.iloc[i] = 1
+            else:  # previous was final_lb
+                if close.iloc[i] >= final_lb.iloc[i]:
+                    supertrend.iloc[i] = final_lb.iloc[i]
+                    direction.iloc[i] = 1
+                else:
+                    supertrend.iloc[i] = final_ub.iloc[i]
+                    direction.iloc[i] = -1
+
+    df["supertrend"] = supertrend
+    df["st_dir"] = direction
+    return df
+
+
+def ensure_rsi(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+    """Ensure df has an 'rsi' column. If not, compute a basic RSI."""
+    if "rsi" in df.columns:
+        return df
+
+    close = df["close"]
+    delta = close.diff()
+
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+
+    df["rsi"] = rsi
+    return df
+
+
 def backtest_trend_squeeze(
     df: pd.DataFrame,
     symbol: str,
     hold_bars: int,
     bbw_abs_threshold: float,
     bbw_pct_threshold: float,
+    st_period: int,
+    st_mult: float,
+    rsi_long_target: float,
+    rsi_short_target: float,
 ) -> pd.DataFrame:
     """
-    Simple time-based backtest:
-    - Use prepare_trend_squeeze() to mark setups
-    - Entry: next bar's open after signal
-    - Exit: after `hold_bars` bars (or last bar)
-    - LONG for Bullish Squeeze, SHORT for Bearish Squeeze
+    Backtest Trend + Squeeze with:
+      - Supertrend SL
+      - RSI-based target
+      - Time-based exit fallback
+
+    Entry: next bar's open after signal.
+    Exit: first of
+      - Target hit    (RSI >= long_target for LONG, <= short_target for SHORT)
+      - SL hit        (Supertrend flip or price crossing ST)
+      - Time exit     (after `hold_bars` bars)
     """
 
+    # Compute squeeze/trend logic
     df_prepped = prepare_trend_squeeze(
         df,
         bbw_abs_threshold=bbw_abs_threshold,
         bbw_pct_threshold=bbw_pct_threshold,
     )
 
+    # Ensure RSI exists
+    df_prepped = ensure_rsi(df_prepped)
+
+    # Add Supertrend
+    df_prepped = compute_supertrend(df_prepped, period=st_period, multiplier=st_mult)
+
     signals = df_prepped[df_prepped["setup"] != ""].copy()
     if signals.empty:
-        return pd.DataFrame(columns=[
-            "symbol", "signal_time", "entry_time", "exit_time",
-            "setup", "direction", "entry_price", "exit_price", "return_pct"
-        ])
+        return pd.DataFrame(
+            columns=[
+                "symbol",
+                "signal_time",
+                "entry_time",
+                "exit_time",
+                "setup",
+                "direction",
+                "exit_reason",
+                "entry_price",
+                "exit_price",
+                "return_pct",
+            ]
+        )
 
     trades = []
     indexed_df = df_prepped.copy()
 
     for ts in signals.index:
-        # Index of the signal bar
         try:
             idx = indexed_df.index.get_loc(ts)
         except KeyError:
@@ -134,29 +258,64 @@ def backtest_trend_squeeze(
 
         entry_idx = idx + 1
         if entry_idx >= len(indexed_df):
-            continue  # can't trade on the last bar
+            continue  # can't enter on last bar
 
-        exit_idx = min(entry_idx + hold_bars - 1, len(indexed_df) - 1)
-
-        entry_time = indexed_df.index[entry_idx]
-        exit_time = indexed_df.index[exit_idx]
-
-        entry_price = indexed_df["open"].iloc[entry_idx]
-        exit_price = indexed_df["close"].iloc[exit_idx]
+        max_exit_idx = min(entry_idx + hold_bars - 1, len(indexed_df) - 1)
 
         setup = signals.loc[ts, "setup"]
-        direction = 1 if setup == "Bullish Squeeze" else -1
+        is_long = setup == "Bullish Squeeze"
+        direction = 1 if is_long else -1
+
+        entry_time = indexed_df.index[entry_idx]
+        entry_price = indexed_df["open"].iloc[entry_idx]
+
+        exit_idx = max_exit_idx
+        exit_reason = "TIME_EXIT"
+
+        # Walk bar by bar to see if target or SL hits earlier
+        for j in range(entry_idx, max_exit_idx + 1):
+            row = indexed_df.iloc[j]
+            c = row["close"]
+            rsi = row["rsi"]
+            st_line = row["supertrend"]
+            st_dir = row["st_dir"]
+
+            if is_long:
+                # Target first
+                if rsi >= rsi_long_target:
+                    exit_idx = j
+                    exit_reason = "TARGET_RSI"
+                    break
+                # SL: price breaks below ST or ST flips bearish
+                if (not np.isnan(st_line)) and (c < st_line or st_dir < 0):
+                    exit_idx = j
+                    exit_reason = "STOP_SUPERTREND"
+                    break
+            else:
+                # SHORT
+                if rsi <= rsi_short_target:
+                    exit_idx = j
+                    exit_reason = "TARGET_RSI"
+                    break
+                if (not np.isnan(st_line)) and (c > st_line or st_dir > 0):
+                    exit_idx = j
+                    exit_reason = "STOP_SUPERTREND"
+                    break
+
+        exit_time = indexed_df.index[exit_idx]
+        exit_price = indexed_df["close"].iloc[exit_idx]
 
         ret_pct = direction * (exit_price / entry_price - 1.0) * 100.0
 
         trades.append(
             {
                 "symbol": symbol,
-                "signal_time": ts,
-                "entry_time": entry_time,
-                "exit_time": exit_time,
+                "signal_time": format_ts(ts),
+                "entry_time": format_ts(entry_time),
+                "exit_time": format_ts(exit_time),
                 "setup": setup,
-                "direction": "LONG" if direction == 1 else "SHORT",
+                "direction": "LONG" if is_long else "SHORT",
+                "exit_reason": exit_reason,
                 "entry_price": round(entry_price, 2),
                 "exit_price": round(exit_price, 2),
                 "return_pct": round(ret_pct, 2),
@@ -241,7 +400,7 @@ fallback_nifty50 = [
     "SBILIFE",
     "SUNPHARMA",
     "TATACONSUM",
-    "TMPV",  # Tata Motors Passenger Vehicles (post-demerger symbol)
+    "TMPV",
     "TATASTEEL",
     "TCS",
     "TECHM",
@@ -259,7 +418,6 @@ live_nifty50 = fetch_nifty50_symbols()
 INVALID_SYMBOLS = {"DUMMYHDLVR", "DUMMY1", "DUMMY2", "DUMMY"}
 
 if live_nifty50:
-    # Filter out NSE's occasional dummy / invalid placeholders
     clean_symbols = [
         s
         for s in live_nifty50
@@ -408,12 +566,48 @@ with backtest_tab:
             )
         with col_bt2:
             hold_bars = st.slider(
-                "Holding period (bars)",
+                "Max holding period (bars)",
                 min_value=2,
                 max_value=24,
                 value=8,
                 step=1,
-                help="Number of 15-minute bars to hold after entry.",
+                help="Maximum number of 15-minute bars to hold after entry.",
+            )
+
+        col_st1, col_st2 = st.columns(2)
+        with col_st1:
+            st_period = st.slider(
+                "Supertrend period",
+                min_value=7,
+                max_value=20,
+                value=10,
+                step=1,
+            )
+        with col_st2:
+            st_mult = st.slider(
+                "Supertrend multiplier",
+                min_value=1.5,
+                max_value=4.0,
+                value=3.0,
+                step=0.5,
+            )
+
+        col_rsi1, col_rsi2 = st.columns(2)
+        with col_rsi1:
+            rsi_long_target = st.slider(
+                "RSI target for LONG",
+                min_value=55,
+                max_value=80,
+                value=70,
+                step=1,
+            )
+        with col_rsi2:
+            rsi_short_target = st.slider(
+                "RSI target for SHORT",
+                min_value=20,
+                max_value=45,
+                value=30,
+                step=1,
             )
 
         run_bt = st.button("Run Backtest")
@@ -447,6 +641,10 @@ with backtest_tab:
                         hold_bars=hold_bars,
                         bbw_abs_threshold=bbw_abs_threshold,
                         bbw_pct_threshold=bbw_pct_threshold,
+                        st_period=st_period,
+                        st_mult=st_mult,
+                        rsi_long_target=rsi_long_target,
+                        rsi_short_target=rsi_short_target,
                     )
 
                     if trades.empty:
