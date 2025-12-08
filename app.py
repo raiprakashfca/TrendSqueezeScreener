@@ -9,6 +9,11 @@ from kiteconnect import KiteConnect
 from streamlit_autorefresh import st_autorefresh
 
 from utils.token_utils import load_credentials_from_gsheet
+
+api_key, api_secret, access_token = load_credentials_from_gsheet("ZerodhaTokenStore")
+kite = KiteConnect(api_key=api_key)
+kite.set_access_token(access_token)
+
 from utils.zerodha_utils import (
     get_ohlc_15min,
     build_instrument_token_map,
@@ -305,3 +310,4 @@ if screener_data:
     st.dataframe(df_out, use_container_width=True)
 else:
     st.info("No stocks currently match the Trend Squeeze criteria.")
+
