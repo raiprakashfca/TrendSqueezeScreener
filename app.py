@@ -254,7 +254,7 @@ for symbol in stock_list:
         continue
 
     try:
-        df = get_ohlc_15min(kite, token)
+        df = get_ohlc_15min(kite, token, show_debug=show_debug)
 
         if df is None or df.shape[0] < 60:
             if show_debug:
