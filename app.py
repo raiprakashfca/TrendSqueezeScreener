@@ -172,10 +172,26 @@ fallback_nifty50 = [
     "SHREECEM",
 ]
 
+# Try to fetch live NIFTY50 list from NSE
 live_nifty50 = fetch_nifty50_symbols()
+
+INVALID_SYMBOLS = {"DUMMYHDLVR", "DUMMY1", "DUMMY2", "DUMMY"}
+
 if live_nifty50:
-    stock_list = live_nifty50
-    st.caption(f"Universe: Latest NIFTY 50 from NSE (fetched {len(stock_list)} symbols).")
+    # Filter out NSE's occasional dummy / invalid placeholders
+    clean_symbols = [
+        s
+        for s in live_nifty50
+        if s.isalpha() and "DUMMY" not in s.upper() and s not in INVALID_SYMBOLS
+    ]
+
+    if len(clean_symbols) < len(live_nifty50):
+        st.warning(
+            "Some NSE symbols were invalid or temporary placeholders and were removed."
+        )
+
+    stock_list = clean_symbols
+    st.caption(f"Universe: Latest NIFTY 50 from NSE (cleaned, {len(stock_list)} symbols).")
 else:
     stock_list = fallback_nifty50
     st.caption("Universe: Fallback hard-coded NIFTY 50 list (NSE CSV unavailable).")
