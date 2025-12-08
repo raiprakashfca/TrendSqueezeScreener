@@ -5,12 +5,18 @@ from zoneinfo import ZoneInfo
 
 IST = ZoneInfo("Asia/Kolkata")
 
-# NSE holidays – extend as needed
+# NSE holidays – extend this list as needed
 indian_market_holidays = [
-    "2025-01-26", "2025-03-29", "2025-04-10", "2025-04-14", "2025-05-01",
-    "2025-08-15", "2025-10-02", "2025-11-03", "2025-12-25",
+    "2025-01-26",
+    "2025-03-29",
+    "2025-04-10",
+    "2025-04-14",
+    "2025-05-01",
+    "2025-08-15",
+    "2025-10-02",
+    "2025-11-03",
+    "2025-12-25",
 ]
-
 
 MARKET_OPEN = time(9, 15)
 MARKET_CLOSE = time(15, 30)
@@ -46,12 +52,13 @@ def _get_session_mode():
 
 def get_ohlc_15min(
     kite,
-    instrument_token,
+    instrument_token: int,
     lookback_days: int = 10,
     min_candles: int = 60,
+    show_debug: bool = False,
 ):
     """
-    Fetch 15-minute OHLCV data for a symbol with safe session handling.
+    Fetch 15-minute OHLCV data for an instrument token with safe session handling.
 
     - During live market hours:
         -> Fetch up to `lookback_days` of 15m history *ending now* (includes today).
@@ -82,6 +89,7 @@ def get_ohlc_15min(
             interval="15minute",
         )
     except Exception as e:
+        # This is a real error – keep this visible regardless of debug
         st.warning(f"{instrument_token}: Failed to fetch historical data ({label}): {e}")
         return None
 
@@ -96,18 +104,22 @@ def get_ohlc_15min(
     df = df[["open", "high", "low", "close", "volume"]]
 
     if df.shape[0] < min_candles:
-        st.warning(
-            f"{instrument_token}: Only {df.shape[0]} candles fetched "
-            f"(min recommended {min_candles}) for {label}."
-        )
-        # Still return df so the caller can decide to skip or not
+        # This is borderline – only show if debugging
+        if show_debug:
+            st.warning(
+                f"{instrument_token}: Only {df.shape[0]} candles fetched "
+                f"(min recommended {min_candles}) for {label}."
+            )
         return df
 
-    last_ts = df.index[-1]
-    st.caption(
-        f"{instrument_token}: Using {df.shape[0]} candles up to "
-        f"{last_ts.strftime('%d %b %Y %H:%M')} IST • {label}"
-    )
+    # Previously this was always printed – now only in debug mode
+    if show_debug:
+        last_ts = df.index[-1]
+        st.write(
+            f"{instrument_token}: Using {df.shape[0]} candles up to "
+            f"{last_ts.strftime('%d %b %Y %H:%M')} IST • {label}"
+        )
+
     return df
 
 
@@ -121,7 +133,7 @@ def build_instrument_token_map(
     Resolve NSE symbols to instrument tokens using kite.ltp in small chunks.
 
     This drastically reduces API calls:
-      - Old approach: 1 ltp() per symbol (100 calls for NIFTY100)
+      - Old approach: 1 ltp() per symbol (100 calls for NIFTY50/100)
       - New approach: ~len(symbols)/chunk_size calls (2 calls for chunk_size=50)
 
     If some symbols fail, they are skipped with a warning.
@@ -130,7 +142,7 @@ def build_instrument_token_map(
     instruments = [f"{exchange}:{s}" for s in symbols]
 
     for i in range(0, len(instruments), chunk_size):
-        chunk = instruments[i:i + chunk_size]
+        chunk = instruments[i : i + chunk_size]
         try:
             ltp_data = kite.ltp(chunk)
         except Exception as e:
