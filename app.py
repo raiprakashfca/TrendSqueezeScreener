@@ -115,6 +115,13 @@ kite = KiteConnect(api_key=api_key)
 kite.set_access_token(access_token)
 
 # -----------------------------
+# ⚙️ Sidebar controls
+# -----------------------------
+with st.sidebar:
+    st.subheader("Settings")
+    show_debug = st.checkbox("Show debug messages", value=False)
+
+# -----------------------------
 # 📈 NIFTY 50 stock universe
 # -----------------------------
 
@@ -185,7 +192,7 @@ if live_nifty50:
         if s.isalpha() and "DUMMY" not in s.upper() and s not in INVALID_SYMBOLS
     ]
 
-    if len(clean_symbols) < len(live_nifty50):
+    if len(clean_symbols) < len(live_nifty50) and show_debug:
         st.warning(
             "Some NSE symbols were invalid or temporary placeholders and were removed."
         )
@@ -233,20 +240,26 @@ instrument_token_map = build_instrument_token_map(kite, stock_list)
 # 🔍 Main screening loop
 # -----------------------------
 screener_data: list[dict] = []
-st.info("📊 Fetching and analyzing NIFTY 50 stocks. Please wait...")
+
+if show_debug:
+    st.info("📊 Fetching and analyzing NIFTY 50 stocks. Please wait...")
+else:
+    st.info("📊 Scanning NIFTY 50... showing only matching setups.")
 
 for symbol in stock_list:
     token = instrument_token_map.get(symbol)
     if not token:
-        st.warning(f"{symbol}: No instrument token found — skipping.")
+        if show_debug:
+            st.warning(f"{symbol}: No instrument token found — skipping.")
         continue
 
     try:
         df = get_ohlc_15min(kite, token)
 
         if df is None or df.shape[0] < 60:
-            count = 0 if df is None else df.shape[0]
-            st.warning(f"{symbol}: Only {count} candles available — skipping.")
+            if show_debug:
+                count = 0 if df is None else df.shape[0]
+                st.warning(f"{symbol}: Only {count} candles available — skipping.")
             continue
 
         df_prepped = prepare_trend_squeeze(
@@ -256,7 +269,8 @@ for symbol in stock_list:
         )
 
         if df_prepped.isnull().values.any():
-            st.warning(f"{symbol}: Indicators contain NaNs — skipping.")
+            if show_debug:
+                st.warning(f"{symbol}: Indicators contain NaNs — skipping.")
             continue
 
         latest = df_prepped.iloc[-1]
@@ -278,7 +292,9 @@ for symbol in stock_list:
             )
 
     except Exception as e:
-        st.warning(f"{symbol}: Failed to fetch or compute — {str(e)}")
+        if show_debug:
+            st.warning(f"{symbol}: Failed to fetch or compute — {str(e)}")
+        continue
 
 # -----------------------------
 # 📋 Output
