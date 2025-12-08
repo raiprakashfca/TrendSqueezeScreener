@@ -9,11 +9,6 @@ from kiteconnect import KiteConnect
 from streamlit_autorefresh import st_autorefresh
 
 from utils.token_utils import load_credentials_from_gsheet
-
-api_key, api_secret, access_token = load_credentials_from_gsheet("ZerodhaTokenStore")
-kite = KiteConnect(api_key=api_key)
-kite.set_access_token(access_token)
-
 from utils.zerodha_utils import (
     get_ohlc_15min,
     build_instrument_token_map,
@@ -24,7 +19,7 @@ from utils.strategy import prepare_trend_squeeze
 # ✅ MUST BE FIRST Streamlit call
 st.set_page_config(page_title="📉 Trend Squeeze Screener", layout="wide")
 
-# 🔁 Auto-refresh every 5 minutes
+# 🔁 Auto-refresh every 5 minutes (only really useful for Live tab)
 st_autorefresh(interval=300000, key="auto_refresh")
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -43,8 +38,6 @@ def fetch_nifty50_symbols() -> list[str] | None:
 
     Returns a list of SYMBOL strings (e.g. ['RELIANCE', 'HDFCBANK', ...])
     or None on failure.
-
-    Uses a browser-like User-Agent and Referer to reduce chances of NSE blocking.
     """
     nifty50_csv_url = "https://nsearchives.nseindia.com/content/indices/ind_nifty50list.csv"
 
@@ -101,8 +94,83 @@ def fetch_nifty50_symbols() -> list[str] | None:
     return symbols
 
 
-st.title("📉 Trend Squeeze Screener (Low BBW after Trend)")
-st.info("⏳ Auto-refresh every 5 minutes is enabled")
+def backtest_trend_squeeze(
+    df: pd.DataFrame,
+    symbol: str,
+    hold_bars: int,
+    bbw_abs_threshold: float,
+    bbw_pct_threshold: float,
+) -> pd.DataFrame:
+    """
+    Simple time-based backtest:
+    - Use prepare_trend_squeeze() to mark setups
+    - Entry: next bar's open after signal
+    - Exit: after `hold_bars` bars (or last bar)
+    - LONG for Bullish Squeeze, SHORT for Bearish Squeeze
+    """
+
+    df_prepped = prepare_trend_squeeze(
+        df,
+        bbw_abs_threshold=bbw_abs_threshold,
+        bbw_pct_threshold=bbw_pct_threshold,
+    )
+
+    signals = df_prepped[df_prepped["setup"] != ""].copy()
+    if signals.empty:
+        return pd.DataFrame(columns=[
+            "symbol", "signal_time", "entry_time", "exit_time",
+            "setup", "direction", "entry_price", "exit_price", "return_pct"
+        ])
+
+    trades = []
+    indexed_df = df_prepped.copy()
+
+    for ts in signals.index:
+        # Index of the signal bar
+        try:
+            idx = indexed_df.index.get_loc(ts)
+        except KeyError:
+            continue
+
+        entry_idx = idx + 1
+        if entry_idx >= len(indexed_df):
+            continue  # can't trade on the last bar
+
+        exit_idx = min(entry_idx + hold_bars - 1, len(indexed_df) - 1)
+
+        entry_time = indexed_df.index[entry_idx]
+        exit_time = indexed_df.index[exit_idx]
+
+        entry_price = indexed_df["open"].iloc[entry_idx]
+        exit_price = indexed_df["close"].iloc[exit_idx]
+
+        setup = signals.loc[ts, "setup"]
+        direction = 1 if setup == "Bullish Squeeze" else -1
+
+        ret_pct = direction * (exit_price / entry_price - 1.0) * 100.0
+
+        trades.append(
+            {
+                "symbol": symbol,
+                "signal_time": ts,
+                "entry_time": entry_time,
+                "exit_time": exit_time,
+                "setup": setup,
+                "direction": "LONG" if direction == 1 else "SHORT",
+                "entry_price": round(entry_price, 2),
+                "exit_price": round(exit_price, 2),
+                "return_pct": round(ret_pct, 2),
+            }
+        )
+
+    return pd.DataFrame(trades)
+
+
+# =========================
+#   PAGE HEADER
+# =========================
+st.title("📉 Trend Squeeze Screener & Backtester")
+st.info("⏳ Live tab auto-refreshes every 5 minutes. Backtest tab uses historical data.")
 
 now_ist = datetime.now(IST)
 mode_str = (
@@ -113,18 +181,19 @@ mode_str = (
 st.caption(f"{mode_str} • Last refresh: {now_ist.strftime('%d %b %Y • %H:%M:%S')} IST")
 
 # -----------------------------
-# 🔐 Zerodha credentials
-# -----------------------------
-api_key, api_secret, access_token = load_credentials_from_gsheet("ZerodhaTokenStore")
-kite = KiteConnect(api_key=api_key)
-kite.set_access_token(access_token)
-
-# -----------------------------
 # ⚙️ Sidebar controls
 # -----------------------------
 with st.sidebar:
     st.subheader("Settings")
     show_debug = st.checkbox("Show debug messages", value=False)
+
+# -----------------------------
+# 🔐 Zerodha credentials
+# (keep original simple working logic)
+# -----------------------------
+api_key, api_secret, access_token = load_credentials_from_gsheet("ZerodhaTokenStore")
+kite = KiteConnect(api_key=api_key)
+kite.set_access_token(access_token)
 
 # -----------------------------
 # 📈 NIFTY 50 stock universe
@@ -209,7 +278,7 @@ else:
     st.caption("Universe: Fallback hard-coded NIFTY 50 list (NSE CSV unavailable).")
 
 # -----------------------------
-# 🎯 Squeeze configuration
+# 🎯 Squeeze configuration (shared by Live + Backtest)
 # -----------------------------
 col1, col2 = st.columns(2)
 with col1:
@@ -237,77 +306,173 @@ st.caption(
 )
 
 # -----------------------------
-# 🧩 Instrument tokens (API efficient)
+# 🧩 Instrument tokens (shared)
 # -----------------------------
 instrument_token_map = build_instrument_token_map(kite, stock_list)
 
-# -----------------------------
-# 🔍 Main screening loop
-# -----------------------------
-screener_data: list[dict] = []
+# =========================
+#   TABS: LIVE / BACKTEST
+# =========================
+live_tab, backtest_tab = st.tabs(["📺 Live Screener", "📜 Backtest"])
 
-if show_debug:
-    st.info("📊 Fetching and analyzing NIFTY 50 stocks. Please wait...")
-else:
-    st.info("📊 Scanning NIFTY 50... showing only matching setups.")
 
-for symbol in stock_list:
-    token = instrument_token_map.get(symbol)
-    if not token:
-        if show_debug:
-            st.warning(f"{symbol}: No instrument token found — skipping.")
-        continue
+# =========================
+#   LIVE SCREENER TAB
+# =========================
+with live_tab:
+    screener_data: list[dict] = []
 
-    try:
-        df = get_ohlc_15min(kite, token, show_debug=show_debug)
+    if show_debug:
+        st.info("📊 Fetching and analyzing NIFTY 50 stocks (live). Please wait...")
+    else:
+        st.info("📊 Scanning NIFTY 50 (live)... showing only matching setups.")
 
-        if df is None or df.shape[0] < 60:
+    for symbol in stock_list:
+        token = instrument_token_map.get(symbol)
+        if not token:
             if show_debug:
-                count = 0 if df is None else df.shape[0]
-                st.warning(f"{symbol}: Only {count} candles available — skipping.")
+                st.warning(f"{symbol}: No instrument token found — skipping.")
             continue
 
-        df_prepped = prepare_trend_squeeze(
-            df,
-            bbw_abs_threshold=bbw_abs_threshold,
-            bbw_pct_threshold=bbw_pct_threshold,
-        )
+        try:
+            df = get_ohlc_15min(kite, token, show_debug=show_debug)
 
-        if df_prepped.isnull().values.any():
-            if show_debug:
-                st.warning(f"{symbol}: Indicators contain NaNs — skipping.")
-            continue
+            if df is None or df.shape[0] < 60:
+                if show_debug:
+                    count = 0 if df is None else df.shape[0]
+                    st.warning(f"{symbol}: Only {count} candles available — skipping.")
+                continue
 
-        latest = df_prepped.iloc[-1]
-
-        if latest["setup"]:
-            screener_data.append(
-                {
-                    "Symbol": symbol,
-                    "LTP": round(latest["close"], 2),
-                    "BBW": round(latest["bbw"], 4),
-                    "BBW %Rank (20)": round(latest["bbw_pct_rank"], 2)
-                    if pd.notna(latest["bbw_pct_rank"])
-                    else None,
-                    "RSI": round(latest["rsi"], 1),
-                    "ADX": round(latest["adx"], 1),
-                    "Trend": latest["trend"],
-                    "Setup": latest["setup"],
-                }
+            df_prepped = prepare_trend_squeeze(
+                df,
+                bbw_abs_threshold=bbw_abs_threshold,
+                bbw_pct_threshold=bbw_pct_threshold,
             )
 
-    except Exception as e:
-        if show_debug:
-            st.warning(f"{symbol}: Failed to fetch or compute — {str(e)}")
-        continue
+            if df_prepped.isnull().values.any():
+                if show_debug:
+                    st.warning(f"{symbol}: Indicators contain NaNs — skipping.")
+                continue
 
-# -----------------------------
-# 📋 Output
-# -----------------------------
-if screener_data:
-    df_out = pd.DataFrame(screener_data)
-    st.success(f"✅ {len(df_out)} stocks matched the Trend Squeeze criteria.")
-    st.dataframe(df_out, use_container_width=True)
-else:
-    st.info("No stocks currently match the Trend Squeeze criteria.")
+            latest = df_prepped.iloc[-1]
 
+            if latest["setup"]:
+                screener_data.append(
+                    {
+                        "Symbol": symbol,
+                        "LTP": round(latest["close"], 2),
+                        "BBW": round(latest["bbw"], 4),
+                        "BBW %Rank (20)": round(latest["bbw_pct_rank"], 2)
+                        if pd.notna(latest["bbw_pct_rank"])
+                        else None,
+                        "RSI": round(latest["rsi"], 1),
+                        "ADX": round(latest["adx"], 1),
+                        "Trend": latest["trend"],
+                        "Setup": latest["setup"],
+                    }
+                )
+
+        except Exception as e:
+            if show_debug:
+                st.warning(f"{symbol}: Failed to fetch or compute — {str(e)}")
+            continue
+
+    if screener_data:
+        df_out = pd.DataFrame(screener_data)
+        st.success(f"✅ {len(df_out)} stocks matched the Trend Squeeze criteria.")
+        st.dataframe(df_out, use_container_width=True)
+    else:
+        st.info("No stocks currently match the Trend Squeeze criteria.")
+
+
+# =========================
+#   BACKTEST TAB
+# =========================
+with backtest_tab:
+    st.subheader("📜 Trend Squeeze Backtest (15-minute)")
+
+    if not instrument_token_map:
+        st.error("No instrument tokens resolved. Cannot run backtest.")
+    else:
+        bt_symbol = st.selectbox("Select symbol to backtest", sorted(stock_list))
+
+        col_bt1, col_bt2 = st.columns(2)
+        with col_bt1:
+            lookback_days = st.slider(
+                "Lookback period (days)",
+                min_value=10,
+                max_value=120,
+                value=60,
+                step=5,
+                help="Number of calendar days of 15-minute history to use.",
+            )
+        with col_bt2:
+            hold_bars = st.slider(
+                "Holding period (bars)",
+                min_value=2,
+                max_value=24,
+                value=8,
+                step=1,
+                help="Number of 15-minute bars to hold after entry.",
+            )
+
+        run_bt = st.button("Run Backtest")
+
+        if run_bt:
+            token = instrument_token_map.get(bt_symbol)
+            if not token:
+                st.error(f"No instrument token found for {bt_symbol}.")
+            else:
+                st.info(
+                    f"Running backtest for {bt_symbol} with {lookback_days} days of 15m data..."
+                )
+
+                df_bt = get_ohlc_15min(
+                    kite,
+                    token,
+                    lookback_days=lookback_days,
+                    min_candles=60,
+                    show_debug=show_debug,
+                )
+
+                if df_bt is None or df_bt.shape[0] < 60:
+                    st.error(
+                        f"Not enough data to backtest {bt_symbol}. "
+                        f"Got {0 if df_bt is None else df_bt.shape[0]} candles."
+                    )
+                else:
+                    trades = backtest_trend_squeeze(
+                        df_bt,
+                        bt_symbol,
+                        hold_bars=hold_bars,
+                        bbw_abs_threshold=bbw_abs_threshold,
+                        bbw_pct_threshold=bbw_pct_threshold,
+                    )
+
+                    if trades.empty:
+                        st.warning(
+                            "No Trend Squeeze signals found in the selected period "
+                            "for this symbol with current thresholds."
+                        )
+                    else:
+                        total_trades = len(trades)
+                        wins = (trades["return_pct"] > 0).sum()
+                        losses = (trades["return_pct"] <= 0).sum()
+                        win_rate = (wins / total_trades) * 100.0
+                        avg_ret = trades["return_pct"].mean()
+                        best = trades["return_pct"].max()
+                        worst = trades["return_pct"].min()
+
+                        st.success(
+                            f"Generated {total_trades} trades for {bt_symbol} "
+                            f"over last {lookback_days} days."
+                        )
+
+                        m1, m2, m3, m4 = st.columns(4)
+                        m1.metric("Total trades", total_trades)
+                        m2.metric("Win rate (%)", f"{win_rate:.1f}")
+                        m3.metric("Avg return / trade (%)", f"{avg_ret:.2f}")
+                        m4.metric("Best / Worst (%)", f"{best:.2f} / {worst:.2f}")
+
+                        st.markdown("#### Trade List")
+                        st.dataframe(trades, use_container_width=True)
