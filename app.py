@@ -203,6 +203,7 @@ def backtest_trend_squeeze(
     st_mult: float,
     rsi_long_target: float,
     rsi_short_target: float,
+    trade_mode: str = "Continuation",
 ) -> pd.DataFrame:
     """
     Backtest Trend + Squeeze with:
@@ -210,7 +211,11 @@ def backtest_trend_squeeze(
       - RSI-based target
       - Time-based exit fallback
 
-    Entry: next bar's open after signal.
+    trade_mode:
+      - "Continuation": Bullish Squeeze = LONG, Bearish Squeeze = SHORT
+      - "Reversal":     Bullish Squeeze = SHORT, Bearish Squeeze = LONG
+
+    Entry: next bar’s open after signal.
     Exit: first of
       - Target hit    (RSI >= long_target for LONG, <= short_target for SHORT)
       - SL hit        (Supertrend flip or price crossing ST)
@@ -263,7 +268,15 @@ def backtest_trend_squeeze(
         max_exit_idx = min(entry_idx + hold_bars - 1, len(indexed_df) - 1)
 
         setup = signals.loc[ts, "setup"]
-        is_long = setup == "Bullish Squeeze"
+
+        # 🔁 Direction depends on trade_mode
+        if trade_mode == "Reversal":
+            # Fade the signal: Bearish → LONG, Bullish → SHORT
+            is_long = (setup == "Bearish Squeeze")
+        else:
+            # Continuation: follow the label
+            is_long = (setup == "Bullish Squeeze")
+
         direction = 1 if is_long else -1
 
         entry_time = indexed_df.index[entry_idx]
@@ -610,6 +623,18 @@ with backtest_tab:
                 step=1,
             )
 
+        # 🔁 NEW: Trade mode – follow trend vs fade trend
+        trade_mode_label = st.radio(
+            "How to trade the squeeze?",
+            options=[
+                "Continuation (with trend)",
+                "Reversal (against trend)",
+            ],
+            index=0,
+            help="Based on your observation, reversal may actually work better for some stocks.",
+        )
+        trade_mode = "Continuation" if "Continuation" in trade_mode_label else "Reversal"
+
         run_bt = st.button("Run Backtest")
 
         if run_bt:
@@ -618,7 +643,8 @@ with backtest_tab:
                 st.error(f"No instrument token found for {bt_symbol}.")
             else:
                 st.info(
-                    f"Running backtest for {bt_symbol} with {lookback_days} days of 15m data..."
+                    f"Running {trade_mode.lower()} backtest for {bt_symbol} with "
+                    f"{lookback_days} days of 15m data..."
                 )
 
                 df_bt = get_ohlc_15min(
@@ -645,6 +671,7 @@ with backtest_tab:
                         st_mult=st_mult,
                         rsi_long_target=rsi_long_target,
                         rsi_short_target=rsi_short_target,
+                        trade_mode=trade_mode,
                     )
 
                     if trades.empty:
@@ -663,7 +690,7 @@ with backtest_tab:
 
                         st.success(
                             f"Generated {total_trades} trades for {bt_symbol} "
-                            f"over last {lookback_days} days."
+                            f"over last {lookback_days} days in {trade_mode} mode."
                         )
 
                         m1, m2, m3, m4 = st.columns(4)
