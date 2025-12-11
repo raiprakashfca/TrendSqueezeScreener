@@ -491,12 +491,13 @@ live_tab, backtest_tab = st.tabs(["📺 Live Screener", "📜 Backtest"])
 #   LIVE SCREENER TAB
 # =========================
 with live_tab:
-    screener_data: list[dict] = []
+    continuation_rows: list[dict] = []
+    reversal_rows: list[dict] = []
 
     if show_debug:
         st.info("📊 Fetching and analyzing NIFTY 50 stocks (live). Please wait...")
     else:
-        st.info("📊 Scanning NIFTY 50 (live)... showing only matching setups.")
+        st.info("📊 Scanning NIFTY 50 (live)... showing continuation and reversal candidates.")
 
     for symbol in stock_list:
         token = instrument_token_map.get(symbol)
@@ -527,34 +528,58 @@ with live_tab:
 
             latest = df_prepped.iloc[-1]
 
-            if latest["setup"]:
-                screener_data.append(
-                    {
-                        "Symbol": symbol,
-                        "LTP": round(latest["close"], 2),
-                        "BBW": round(latest["bbw"], 4),
-                        "BBW %Rank (20)": round(latest["bbw_pct_rank"], 2)
-                        if pd.notna(latest["bbw_pct_rank"])
-                        else None,
-                        "RSI": round(latest["rsi"], 1),
-                        "ADX": round(latest["adx"], 1),
-                        "Trend": latest["trend"],
-                        "Setup": latest["setup"],
-                    }
-                )
+            setup = latest["setup"]
+            if not setup:
+                continue
+
+            # Common fields
+            base_row = {
+                "Symbol": symbol,
+                "LTP": round(latest["close"], 2),
+                "BBW": round(latest["bbw"], 4),
+                "BBW %Rank (20)": round(latest["bbw_pct_rank"], 2)
+                if pd.notna(latest["bbw_pct_rank"])
+                else None,
+                "RSI": round(latest["rsi"], 1),
+                "ADX": round(latest["adx"], 1),
+                "Trend": latest["trend"],
+                "Setup": setup,
+            }
+
+            # Continuation interpretation (with trend)
+            cont_direction = "LONG" if setup == "Bullish Squeeze" else "SHORT"
+            cont_row = base_row.copy()
+            cont_row["Bias"] = cont_direction
+            continuation_rows.append(cont_row)
+
+            # Reversal interpretation (against trend)
+            rev_direction = "LONG" if setup == "Bearish Squeeze" else "SHORT"
+            rev_row = base_row.copy()
+            rev_row["Bias"] = rev_direction
+            reversal_rows.append(rev_row)
 
         except Exception as e:
             if show_debug:
                 st.warning(f"{symbol}: Failed to fetch or compute — {str(e)}")
             continue
 
-    if screener_data:
-        df_out = pd.DataFrame(screener_data)
-        st.success(f"✅ {len(df_out)} stocks matched the Trend Squeeze criteria.")
-        st.dataframe(df_out, use_container_width=True)
+    # Show continuation table
+    st.markdown("### 🔵 Continuation Setups (with trend)")
+    if continuation_rows:
+        df_cont = pd.DataFrame(continuation_rows)
+        st.success(f"{len(df_cont)} continuation candidates found.")
+        st.dataframe(df_cont, use_container_width=True)
     else:
-        st.info("No stocks currently match the Trend Squeeze criteria.")
+        st.info("No continuation setups currently.")
 
+    # Show reversal table
+    st.markdown("### 🟠 Reversal Setups (against trend)")
+    if reversal_rows:
+        df_rev = pd.DataFrame(reversal_rows)
+        st.success(f"{len(df_rev)} reversal candidates found.")
+        st.dataframe(df_rev, use_container_width=True)
+    else:
+        st.info("No reversal setups currently.")
 
 # =========================
 #   BACKTEST TAB
@@ -623,7 +648,7 @@ with backtest_tab:
                 step=1,
             )
 
-        # 🔁 NEW: Trade mode – follow trend vs fade trend
+        # 🔁 Trade mode – follow trend vs fade trend
         trade_mode_label = st.radio(
             "How to trade the squeeze?",
             options=[
@@ -631,7 +656,7 @@ with backtest_tab:
                 "Reversal (against trend)",
             ],
             index=0,
-            help="Based on your observation, reversal may actually work better for some stocks.",
+            help="Based on your tests, reversal may actually work better for some stocks.",
         )
         trade_mode = "Continuation" if "Continuation" in trade_mode_label else "Reversal"
 
