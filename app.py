@@ -197,6 +197,25 @@ def ensure_rsi(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
     return df
 
 
+def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
+    """
+    Compute Average True Range (ATR) and add it as 'atr' column.
+    """
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+
+    prev_close = close.shift(1)
+    tr1 = high - low
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    atr = tr.rolling(period).mean()
+    df["atr"] = atr
+    return df
+
+
 # =========================
 #   GOOGLE SHEETS HELPERS
 # =========================
@@ -217,7 +236,7 @@ SIGNAL_COLUMNS = [
 ]
 
 
-def get_signals_worksheet() -> "gspread.Worksheet | None":
+def get_signals_worksheet():
     """Get or create the Google Sheet used to store live signals."""
     try:
         service_account_info = st.secrets["gcp_service_account"]
@@ -274,7 +293,7 @@ def persist_and_get_recent_signals(
     Persist current signals to Google Sheet and return two DataFrames:
       - recent continuation signals (last 24h, dedup by symbol+mode)
       - recent reversal signals (last 24h, dedup by symbol+mode)
-    If sheet is not available, just return inputs.
+    If sheet is not available, just return inputs (current scan only).
     """
     ws = get_signals_worksheet()
     if ws is None:
@@ -401,7 +420,9 @@ def persist_and_get_recent_signals(
             ]
         ]
     else:
-        df_cont_display = pd.DataFrame(columns=["Timestamp", "Symbol", "Bias", "LTP", "BBW", "BBW %Rank (20)", "RSI", "ADX", "Trend", "Setup"])
+        df_cont_display = pd.DataFrame(
+            columns=["Timestamp", "Symbol", "Bias", "LTP", "BBW", "BBW %Rank (20)", "RSI", "ADX", "Trend", "Setup"]
+        )
 
     if not df_rev_recent.empty:
         df_rev_recent = df_rev_recent.sort_values("timestamp", ascending=False)
@@ -436,7 +457,9 @@ def persist_and_get_recent_signals(
             ]
         ]
     else:
-        df_rev_display = pd.DataFrame(columns=["Timestamp", "Symbol", "Bias", "LTP", "BBW", "BBW %Rank (20)", "RSI", "ADX", "Trend", "Setup"])
+        df_rev_display = pd.DataFrame(
+            columns=["Timestamp", "Symbol", "Bias", "LTP", "BBW", "BBW %Rank (20)", "RSI", "ADX", "Trend", "Setup"]
+        )
 
     return df_cont_display, df_rev_display
 
@@ -452,11 +475,13 @@ def backtest_trend_squeeze(
     rsi_long_target: float,
     rsi_short_target: float,
     trade_mode: str = "Continuation",
+    atr_period: int = 14,
+    atr_mult: float = 2.0,
 ) -> pd.DataFrame:
     """
     Backtest Trend + Squeeze with:
-      - Supertrend SL
-      - RSI-based target
+      - Hybrid trailing stop based on Supertrend + ATR
+      - RSI-based profit target
       - Time-based exit fallback
 
     trade_mode:
@@ -465,23 +490,26 @@ def backtest_trend_squeeze(
 
     Entry: next bar’s open after signal.
     Exit: first of
-      - Target hit    (RSI >= long_target for LONG, <= short_target for SHORT)
-      - SL hit        (Supertrend flip or price crossing ST)
-      - Time exit     (after `hold_bars` bars)
+      - TARGET_RSI
+      - TRAIL_STOP_HYBRID (Supertrend + ATR trailing stop)
+      - TIME_EXIT
     """
 
-    # Compute squeeze/trend logic
+    # 1) Compute squeeze/trend logic
     df_prepped = prepare_trend_squeeze(
         df,
         bbw_abs_threshold=bbw_abs_threshold,
         bbw_pct_threshold=bbw_pct_threshold,
     )
 
-    # Ensure RSI exists
+    # 2) Ensure RSI
     df_prepped = ensure_rsi(df_prepped)
 
-    # Add Supertrend
+    # 3) Supertrend
     df_prepped = compute_supertrend(df_prepped, period=st_period, multiplier=st_mult)
+
+    # 4) ATR
+    df_prepped = compute_atr(df_prepped, period=atr_period)
 
     signals = df_prepped[df_prepped["setup"] != ""].copy()
     if signals.empty:
@@ -514,10 +542,9 @@ def backtest_trend_squeeze(
             continue  # can't enter on last bar
 
         max_exit_idx = min(entry_idx + hold_bars - 1, len(indexed_df) - 1)
-
         setup = signals.loc[ts, "setup"]
 
-        # 🔁 Direction depends on trade_mode
+        # Direction depends on trade_mode
         if trade_mode == "Reversal":
             # Fade the signal: Bearish → LONG, Bullish → SHORT
             is_long = (setup == "Bearish Squeeze")
@@ -530,27 +557,57 @@ def backtest_trend_squeeze(
         entry_time = indexed_df.index[entry_idx]
         entry_price = indexed_df["open"].iloc[entry_idx]
 
+        # Initial ATR & stop
+        entry_atr = indexed_df["atr"].iloc[entry_idx]
+        if np.isnan(entry_atr) or entry_atr <= 0:
+            # skip trades with undefined ATR
+            continue
+
+        if is_long:
+            trail_stop = entry_price - atr_mult * entry_atr
+        else:
+            trail_stop = entry_price + atr_mult * entry_atr
+
         exit_idx = max_exit_idx
         exit_reason = "TIME_EXIT"
 
-        # Walk bar by bar to see if target or SL hits earlier
+        # Walk bar by bar
         for j in range(entry_idx, max_exit_idx + 1):
             row = indexed_df.iloc[j]
             c = row["close"]
             rsi = row["rsi"]
             st_line = row["supertrend"]
-            st_dir = row["st_dir"]
+            atr_val = row["atr"]
+
+            # --- Update hybrid trailing stop ---
+            if not np.isnan(st_line) and not np.isnan(atr_val) and atr_val > 0:
+                if is_long:
+                    # Tightest stop: min(supertrend, price - ATR*mult)
+                    candidate_st = st_line
+                    candidate_atr = c - atr_mult * atr_val
+                    proposed_stop = min(candidate_st, candidate_atr)
+                    # Trail only upwards
+                    trail_stop = max(trail_stop, proposed_stop)
+                else:
+                    # SHORT: tightest stop above price
+                    candidate_st = st_line
+                    candidate_atr = c + atr_mult * atr_val
+                    proposed_stop = max(candidate_st, candidate_atr)
+                    # Trail only downwards
+                    trail_stop = min(trail_stop, proposed_stop)
+
+            # --- Exit logic priority ---
 
             if is_long:
-                # Target first
+                # 1) RSI target
                 if rsi >= rsi_long_target:
                     exit_idx = j
                     exit_reason = "TARGET_RSI"
                     break
-                # SL: price breaks below ST or ST flips bearish
-                if (not np.isnan(st_line)) and (c < st_line or st_dir < 0):
+                # 2) Hybrid trail stop
+                if c <= trail_stop:
                     exit_idx = j
-                    exit_reason = "STOP_SUPERTREND"
+                    exit_reason = "TRAIL_STOP_HYBRID"
                     break
             else:
                 # SHORT
@@ -558,9 +615,9 @@ def backtest_trend_squeeze(
                     exit_idx = j
                     exit_reason = "TARGET_RSI"
                     break
-                if (not np.isnan(st_line)) and (c > st_line or st_dir > 0):
+                if c >= trail_stop:
                     exit_idx = j
-                    exit_reason = "STOP_SUPERTREND"
+                    exit_reason = "TRAIL_STOP_HYBRID"
                     break
 
         exit_time = indexed_df.index[exit_idx]
@@ -609,7 +666,6 @@ with st.sidebar:
 
 # -----------------------------
 # 🔐 Zerodha credentials
-# (keep original simple working logic)
 # -----------------------------
 api_key, api_secret, access_token = load_credentials_from_gsheet("ZerodhaTokenStore")
 kite = KiteConnect(api_key=api_key)
@@ -811,7 +867,7 @@ with live_tab:
                 st.warning(f"{symbol}: Failed to fetch or compute — {str(e)}")
             continue
 
-    # Turn into DataFrames (may be empty)
+    # Current scan DataFrames (in case sheet is not available)
     df_cont_current = pd.DataFrame(continuation_rows) if continuation_rows else pd.DataFrame(
         columns=["Symbol", "LTP", "BBW", "BBW %Rank (20)", "RSI", "ADX", "Trend", "Setup", "Bias"]
     )
@@ -892,6 +948,24 @@ with backtest_tab:
                 step=0.5,
             )
 
+        col_atr1, col_atr2 = st.columns(2)
+        with col_atr1:
+            atr_period = st.slider(
+                "ATR period",
+                min_value=7,
+                max_value=30,
+                value=14,
+                step=1,
+            )
+        with col_atr2:
+            atr_mult = st.slider(
+                "ATR multiple for hybrid stop",
+                min_value=0.5,
+                max_value=4.0,
+                value=2.0,
+                step=0.25,
+            )
+
         col_rsi1, col_rsi2 = st.columns(2)
         with col_rsi1:
             rsi_long_target = st.slider(
@@ -918,7 +992,7 @@ with backtest_tab:
                 "Reversal (against trend)",
             ],
             index=0,
-            help="Based on your tests, reversal may actually work better for some stocks.",
+            help="Reversal may work better for some stocks; test both.",
         )
         trade_mode = "Continuation" if "Continuation" in trade_mode_label else "Reversal"
 
@@ -959,6 +1033,8 @@ with backtest_tab:
                         rsi_long_target=rsi_long_target,
                         rsi_short_target=rsi_short_target,
                         trade_mode=trade_mode,
+                        atr_period=atr_period,
+                        atr_mult=atr_mult,
                     )
 
                     if trades.empty:
