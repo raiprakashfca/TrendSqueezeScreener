@@ -1,5 +1,5 @@
 import io
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -8,6 +8,10 @@ import requests
 import streamlit as st
 from kiteconnect import KiteConnect
 from streamlit_autorefresh import st_autorefresh
+
+import gspread
+from gspread.exceptions import SpreadsheetNotFound
+from oauth2client.service_account import ServiceAccountCredentials
 
 from utils.token_utils import load_credentials_from_gsheet
 from utils.zerodha_utils import (
@@ -191,6 +195,250 @@ def ensure_rsi(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
 
     df["rsi"] = rsi
     return df
+
+
+# =========================
+#   GOOGLE SHEETS HELPERS
+# =========================
+
+SIGNAL_SHEET_NAME = "TrendSqueezeSignals"
+SIGNAL_COLUMNS = [
+    "timestamp",     # ISO string
+    "symbol",
+    "mode",          # Continuation / Reversal
+    "bias",          # LONG / SHORT
+    "ltp",
+    "bbw",
+    "bbw_pct_rank",
+    "rsi",
+    "adx",
+    "trend",
+    "setup",
+]
+
+
+def get_signals_worksheet() -> "gspread.Worksheet | None":
+    """Get or create the Google Sheet used to store live signals."""
+    try:
+        service_account_info = st.secrets["gcp_service_account"]
+    except Exception:
+        # If secrets not present, just skip persistence gracefully
+        return None
+
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive",
+    ]
+
+    try:
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(service_account_info, scope)
+        client = gspread.authorize(creds)
+    except Exception:
+        return None
+
+    try:
+        sh = client.open(SIGNAL_SHEET_NAME)
+    except SpreadsheetNotFound:
+        # Create sheet in service account's Drive
+        try:
+            sh = client.create(SIGNAL_SHEET_NAME)
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+    ws = sh.sheet1
+
+    # Ensure header row exists
+    try:
+        header = ws.row_values(1)
+        if not header:
+            ws.append_row(SIGNAL_COLUMNS)
+    except Exception:
+        # If anything weird, just try to reset header
+        try:
+            ws.clear()
+            ws.append_row(SIGNAL_COLUMNS)
+        except Exception:
+            return None
+
+    return ws
+
+
+def persist_and_get_recent_signals(
+    df_cont: pd.DataFrame,
+    df_rev: pd.DataFrame,
+    now_ist: datetime,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Persist current signals to Google Sheet and return two DataFrames:
+      - recent continuation signals (last 24h, dedup by symbol+mode)
+      - recent reversal signals (last 24h, dedup by symbol+mode)
+    If sheet is not available, just return inputs.
+    """
+    ws = get_signals_worksheet()
+    if ws is None:
+        # Persistence not available => behave like old version
+        return df_cont, df_rev
+
+    # Build new rows from current scan
+    new_rows = []
+
+    ts_str = now_ist.strftime("%Y-%m-%d %H:%M:%S")
+
+    if not df_cont.empty:
+        for _, r in df_cont.iterrows():
+            new_rows.append(
+                [
+                    ts_str,
+                    r["Symbol"],
+                    "Continuation",
+                    r["Bias"],
+                    r["LTP"],
+                    r["BBW"],
+                    r["BBW %Rank (20)"],
+                    r["RSI"],
+                    r["ADX"],
+                    r["Trend"],
+                    r["Setup"],
+                ]
+            )
+
+    if not df_rev.empty:
+        for _, r in df_rev.iterrows():
+            new_rows.append(
+                [
+                    ts_str,
+                    r["Symbol"],
+                    "Reversal",
+                    r["Bias"],
+                    r["LTP"],
+                    r["BBW"],
+                    r["BBW %Rank (20)"],
+                    r["RSI"],
+                    r["ADX"],
+                    r["Trend"],
+                    r["Setup"],
+                ]
+            )
+
+    # Fetch existing rows
+    try:
+        records = ws.get_all_records()
+    except Exception:
+        return df_cont, df_rev
+
+    if records:
+        df_existing = pd.DataFrame(records)
+    else:
+        df_existing = pd.DataFrame(columns=SIGNAL_COLUMNS)
+
+    # Append new rows to sheet (persistent store)
+    if new_rows:
+        try:
+            ws.append_rows(new_rows)
+        except Exception:
+            # Even if append fails, we can still use existing for display
+            pass
+
+    # Build full DF for last 24h view (existing + newly created)
+    df_new = pd.DataFrame(new_rows, columns=SIGNAL_COLUMNS) if new_rows else pd.DataFrame(columns=SIGNAL_COLUMNS)
+
+    if df_existing.empty and df_new.empty:
+        return df_cont, df_rev
+
+    df_all = pd.concat([df_existing, df_new], ignore_index=True)
+
+    # Parse timestamp
+    try:
+        df_all["timestamp"] = pd.to_datetime(df_all["timestamp"])
+    except Exception:
+        # If parsing fails, bail out to current-only
+        return df_cont, df_rev
+
+    # Filter last 24 hours (in IST, but timestamps stored without tz)
+    cutoff = now_ist.replace(tzinfo=None) - timedelta(hours=24)
+    df_recent = df_all[df_all["timestamp"] >= cutoff].copy()
+
+    if df_recent.empty:
+        return df_cont, df_rev
+
+    # Build continuation and reversal views
+    df_cont_recent = df_recent[df_recent["mode"] == "Continuation"].copy()
+    df_rev_recent = df_recent[df_recent["mode"] == "Reversal"].copy()
+
+    # Deduplicate by symbol+mode, keep latest timestamp
+    if not df_cont_recent.empty:
+        df_cont_recent = df_cont_recent.sort_values("timestamp", ascending=False)
+        df_cont_recent = df_cont_recent.drop_duplicates(subset=["symbol", "mode"], keep="first")
+        df_cont_recent["Timestamp"] = df_cont_recent["timestamp"].dt.strftime("%d-%b-%Y %H:%M")
+        df_cont_recent.rename(
+            columns={
+                "symbol": "Symbol",
+                "bias": "Bias",
+                "ltp": "LTP",
+                "bbw": "BBW",
+                "bbw_pct_rank": "BBW %Rank (20)",
+                "rsi": "RSI",
+                "adx": "ADX",
+                "trend": "Trend",
+                "setup": "Setup",
+            },
+            inplace=True,
+        )
+        df_cont_display = df_cont_recent[
+            [
+                "Timestamp",
+                "Symbol",
+                "Bias",
+                "LTP",
+                "BBW",
+                "BBW %Rank (20)",
+                "RSI",
+                "ADX",
+                "Trend",
+                "Setup",
+            ]
+        ]
+    else:
+        df_cont_display = pd.DataFrame(columns=["Timestamp", "Symbol", "Bias", "LTP", "BBW", "BBW %Rank (20)", "RSI", "ADX", "Trend", "Setup"])
+
+    if not df_rev_recent.empty:
+        df_rev_recent = df_rev_recent.sort_values("timestamp", ascending=False)
+        df_rev_recent = df_rev_recent.drop_duplicates(subset=["symbol", "mode"], keep="first")
+        df_rev_recent["Timestamp"] = df_rev_recent["timestamp"].dt.strftime("%d-%b-%Y %H:%M")
+        df_rev_recent.rename(
+            columns={
+                "symbol": "Symbol",
+                "bias": "Bias",
+                "ltp": "LTP",
+                "bbw": "BBW",
+                "bbw_pct_rank": "BBW %Rank (20)",
+                "rsi": "RSI",
+                "adx": "ADX",
+                "trend": "Trend",
+                "setup": "Setup",
+            },
+            inplace=True,
+        )
+        df_rev_display = df_rev_recent[
+            [
+                "Timestamp",
+                "Symbol",
+                "Bias",
+                "LTP",
+                "BBW",
+                "BBW %Rank (20)",
+                "RSI",
+                "ADX",
+                "Trend",
+                "Setup",
+            ]
+        ]
+    else:
+        df_rev_display = pd.DataFrame(columns=["Timestamp", "Symbol", "Bias", "LTP", "BBW", "BBW %Rank (20)", "RSI", "ADX", "Trend", "Setup"])
+
+    return df_cont_display, df_rev_display
 
 
 def backtest_trend_squeeze(
@@ -497,7 +745,7 @@ with live_tab:
     if show_debug:
         st.info("📊 Fetching and analyzing NIFTY 50 stocks (live). Please wait...")
     else:
-        st.info("📊 Scanning NIFTY 50 (live)... showing continuation and reversal candidates.")
+        st.info("📊 Scanning NIFTY 50 (live)... showing continuation and reversal candidates (last 24h).")
 
     for symbol in stock_list:
         token = instrument_token_map.get(symbol)
@@ -563,23 +811,37 @@ with live_tab:
                 st.warning(f"{symbol}: Failed to fetch or compute — {str(e)}")
             continue
 
+    # Turn into DataFrames (may be empty)
+    df_cont_current = pd.DataFrame(continuation_rows) if continuation_rows else pd.DataFrame(
+        columns=["Symbol", "LTP", "BBW", "BBW %Rank (20)", "RSI", "ADX", "Trend", "Setup", "Bias"]
+    )
+    df_rev_current = pd.DataFrame(reversal_rows) if reversal_rows else pd.DataFrame(
+        columns=["Symbol", "LTP", "BBW", "BBW %Rank (20)", "RSI", "ADX", "Trend", "Setup", "Bias"]
+    )
+
+    # 🔁 Persist + show last 24h view
+    df_cont_display, df_rev_display = persist_and_get_recent_signals(
+        df_cont_current,
+        df_rev_current,
+        now_ist,
+    )
+
     # Show continuation table
-    st.markdown("### 🔵 Continuation Setups (with trend)")
-    if continuation_rows:
-        df_cont = pd.DataFrame(continuation_rows)
-        st.success(f"{len(df_cont)} continuation candidates found.")
-        st.dataframe(df_cont, use_container_width=True)
+    st.markdown("### 🔵 Continuation Setups (with trend) – last 24 hours")
+    if not df_cont_display.empty:
+        st.success(f"{len(df_cont_display)} continuation candidates in the last 24 hours.")
+        st.dataframe(df_cont_display, use_container_width=True)
     else:
-        st.info("No continuation setups currently.")
+        st.info("No continuation setups in the last 24 hours.")
 
     # Show reversal table
-    st.markdown("### 🟠 Reversal Setups (against trend)")
-    if reversal_rows:
-        df_rev = pd.DataFrame(reversal_rows)
-        st.success(f"{len(df_rev)} reversal candidates found.")
-        st.dataframe(df_rev, use_container_width=True)
+    st.markdown("### 🟠 Reversal Setups (against trend) – last 24 hours")
+    if not df_rev_display.empty:
+        st.success(f"{len(df_rev_display)} reversal candidates in the last 24 hours.")
+        st.dataframe(df_rev_display, use_container_width=True)
     else:
-        st.info("No reversal setups currently.")
+        st.info("No reversal setups in the last 24 hours.")
+
 
 # =========================
 #   BACKTEST TAB
