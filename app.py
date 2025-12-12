@@ -10,7 +10,7 @@ from kiteconnect import KiteConnect
 from streamlit_autorefresh import st_autorefresh
 
 import gspread
-from gspread.exceptions import SpreadsheetNotFound
+from gspread.exceptions import SpreadsheetNotFound, APIError
 from oauth2client.service_account import ServiceAccountCredentials
 
 from utils.token_utils import load_credentials_from_gsheet
@@ -23,29 +23,75 @@ from utils.strategy import prepare_trend_squeeze
 
 # ✅ MUST BE FIRST Streamlit call
 st.set_page_config(page_title="📉 Trend Squeeze Screener", layout="wide")
-
-# 🔁 Auto-refresh every 5 minutes (for Live tab)
-st_autorefresh(interval=300000, key="auto_refresh")
+st_autorefresh(interval=300000, key="auto_refresh")  # 5 min refresh
 
 IST = ZoneInfo("Asia/Kolkata")
 MARKET_OPEN = time(9, 15)
 MARKET_CLOSE = time(15, 30)
 
+SIGNAL_SHEET_NAME = "TrendSqueezeSignals"
+
+# ✅ new schema (includes KEY + candle-time)
+SIGNAL_COLUMNS = [
+    "key",              # unique dedup key
+    "signal_time",      # candle timestamp (IST naive string)
+    "logged_at",        # when app logged it (IST naive string)
+    "symbol",
+    "mode",             # Continuation / Reversal
+    "setup",            # Bullish Squeeze / Bearish Squeeze
+    "bias",             # LONG / SHORT
+    "ltp",
+    "bbw",
+    "bbw_pct_rank",
+    "rsi",
+    "adx",
+    "trend",
+]
+
+
+def now_ist() -> datetime:
+    return datetime.now(IST)
+
 
 def market_open_now() -> bool:
-    now = datetime.now(IST)
-    return is_trading_day(now.date()) and MARKET_OPEN <= now.time() <= MARKET_CLOSE
+    n = now_ist()
+    return is_trading_day(n.date()) and MARKET_OPEN <= n.time() <= MARKET_CLOSE
+
+
+def fmt_dt(dt: datetime) -> str:
+    # store sheet timestamps without tz noise
+    return dt.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def fmt_ts(ts) -> str:
+    # convert pandas timestamp to nice display string
+    if isinstance(ts, pd.Timestamp):
+        try:
+            if ts.tzinfo is not None:
+                ts = ts.tz_convert("Asia/Kolkata")
+        except Exception:
+            pass
+        return ts.strftime("%d-%b-%Y %H:%M")
+    return str(ts)
+
+
+def ts_to_sheet_str(ts) -> str:
+    # store as YYYY-MM-DD HH:MM:SS (IST naive)
+    if isinstance(ts, pd.Timestamp):
+        try:
+            if ts.tzinfo is not None:
+                ts = ts.tz_convert("Asia/Kolkata")
+        except Exception:
+            pass
+        return ts.tz_localize(None).strftime("%Y-%m-%d %H:%M:%S") if ts.tzinfo is None else ts.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(ts, datetime):
+        return ts.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+    return str(ts)
 
 
 def fetch_nifty50_symbols() -> list[str] | None:
-    """
-    Fetch the latest NIFTY 50 constituents from NSE's official CSV.
-
-    Returns a list of SYMBOL strings (e.g. ['RELIANCE', 'HDFCBANK', ...])
-    or None on failure.
-    """
+    """Fetch latest NIFTY50 constituents from NSE CSV."""
     nifty50_csv_url = "https://nsearchives.nseindia.com/content/indices/ind_nifty50list.csv"
-
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -59,75 +105,48 @@ def fetch_nifty50_symbols() -> list[str] | None:
     try:
         resp = requests.get(nifty50_csv_url, headers=headers, timeout=10)
         resp.raise_for_status()
-    except Exception as e:
-        st.warning(f"Failed to download NIFTY 50 CSV from NSE: {e}")
-        return None
-
-    try:
         df = pd.read_csv(io.StringIO(resp.text))
     except Exception as e:
-        st.warning(f"Failed to parse NIFTY 50 CSV: {e}")
+        st.warning(f"Failed to fetch/parse NSE NIFTY50 list: {e}")
         return None
 
     if "Symbol" not in df.columns:
-        st.warning("NSE NIFTY 50 CSV does not contain 'Symbol' column. Format may have changed.")
+        st.warning("NSE NIFTY50 CSV format changed (no 'Symbol' column).")
         return None
 
-    symbols = (
-        df["Symbol"]
-        .astype(str)
-        .str.strip()
-        .dropna()
-        .unique()
-        .tolist()
-    )
+    symbols = sorted(df["Symbol"].astype(str).str.strip().dropna().unique().tolist())
 
-    # Sort for stability
-    symbols = sorted(symbols)
-
-    if len(symbols) != 50:
-        st.warning(
-            f"Expected 50 NIFTY symbols, got {len(symbols)}. "
-            "Proceeding, but please verify against NSE manually."
-        )
-
-    # 🔁 Post-demerger fix:
-    # If NSE still shows TATAMOTORS but you trade TMPV, map it.
+    # Mapping you requested
     if "TATAMOTORS" in symbols and "TMPV" not in symbols:
         symbols = ["TMPV" if s == "TATAMOTORS" else s for s in symbols]
+
+    # Remove obvious garbage
+    INVALID = {"DUMMYHDLVR", "DUMMY1", "DUMMY2", "DUMMY"}
+    symbols = [s for s in symbols if s.isalpha() and s not in INVALID and "DUMMY" not in s.upper()]
 
     return symbols
 
 
-def format_ts(ts: pd.Timestamp) -> str:
-    """Format timestamps nicely, without timezone noise."""
-    if isinstance(ts, pd.Timestamp):
-        try:
-            if ts.tzinfo is not None:
-                ts = ts.tz_convert("Asia/Kolkata")
-        except Exception:
-            pass
-        return ts.strftime("%d-%b-%Y %H:%M")
-    return str(ts)
-
+# ======================
+#  Indicators for backtest exits
+# ======================
 
 def compute_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0) -> pd.DataFrame:
-    """
-    Compute Supertrend (classic ATR-based) and return df with:
-        - 'supertrend': line value
-        - 'st_dir': +1 for bullish, -1 for bearish
-    """
     high = df["high"]
     low = df["low"]
     close = df["close"]
 
     hl2 = (high + low) / 2.0
-
     prev_close = close.shift(1)
-    tr1 = high - low
-    tr2 = (high - prev_close).abs()
-    tr3 = (low - prev_close).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    tr = pd.concat(
+        [
+            (high - low),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
 
     atr = tr.rolling(period).mean()
 
@@ -163,7 +182,7 @@ def compute_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3
                 else:
                     supertrend.iloc[i] = final_lb.iloc[i]
                     direction.iloc[i] = 1
-            else:  # previous was final_lb
+            else:
                 if close.iloc[i] >= final_lb.iloc[i]:
                     supertrend.iloc[i] = final_lb.iloc[i]
                     direction.iloc[i] = 1
@@ -177,13 +196,11 @@ def compute_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3
 
 
 def ensure_rsi(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
-    """Ensure df has an 'rsi' column. If not, compute a basic RSI."""
     if "rsi" in df.columns:
         return df
 
     close = df["close"]
     delta = close.diff()
-
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
 
@@ -191,278 +208,196 @@ def ensure_rsi(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
     avg_loss = loss.rolling(period).mean()
 
     rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-
-    df["rsi"] = rsi
+    df["rsi"] = 100 - (100 / (1 + rs))
     return df
 
 
 def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
-    """
-    Compute Average True Range (ATR) and add it as 'atr' column.
-    """
     high = df["high"]
     low = df["low"]
     close = df["close"]
-
     prev_close = close.shift(1)
-    tr1 = high - low
-    tr2 = (high - prev_close).abs()
-    tr3 = (low - prev_close).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
-    atr = tr.rolling(period).mean()
-    df["atr"] = atr
+    tr = pd.concat(
+        [(high - low), (high - prev_close).abs(), (low - prev_close).abs()],
+        axis=1,
+    ).max(axis=1)
+
+    df["atr"] = tr.rolling(period).mean()
     return df
 
 
-# =========================
-#   GOOGLE SHEETS HELPERS
-# =========================
+# ======================
+#  Google Sheets helpers (robust)
+# ======================
 
-SIGNAL_SHEET_NAME = "TrendSqueezeSignals"
-SIGNAL_COLUMNS = [
-    "timestamp",     # ISO string
-    "symbol",
-    "mode",          # Continuation / Reversal
-    "bias",          # LONG / SHORT
-    "ltp",
-    "bbw",
-    "bbw_pct_rank",
-    "rsi",
-    "adx",
-    "trend",
-    "setup",
-]
-
-
-def get_signals_worksheet():
-    """Get or create the Google Sheet used to store live signals."""
+def get_gspread_client():
     try:
-        service_account_info = st.secrets["gcp_service_account"]
+        sa = st.secrets["gcp_service_account"]
     except Exception:
-        # If secrets not present, just skip persistence gracefully
-        return None
+        return None, "Missing st.secrets['gcp_service_account']"
 
     scope = [
         "https://spreadsheets.google.com/feeds",
         "https://www.googleapis.com/auth/drive",
     ]
-
     try:
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(service_account_info, scope)
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(sa, scope)
         client = gspread.authorize(creds)
-    except Exception:
-        return None
+        return client, None
+    except Exception as e:
+        return None, f"gspread auth failed: {e}"
+
+
+def get_signals_worksheet():
+    client, err = get_gspread_client()
+    if err:
+        return None, err
 
     try:
         sh = client.open(SIGNAL_SHEET_NAME)
     except SpreadsheetNotFound:
-        # Create sheet in service account's Drive
-        try:
-            sh = client.create(SIGNAL_SHEET_NAME)
-        except Exception:
-            return None
-    except Exception:
-        return None
+        return None, (
+            f"Sheet '{SIGNAL_SHEET_NAME}' not found. Create it in Google Drive and share with the service account as Editor."
+        )
+    except Exception as e:
+        return None, f"Failed to open sheet '{SIGNAL_SHEET_NAME}': {e}"
 
-    ws = sh.sheet1
+    try:
+        ws = sh.sheet1
+    except Exception as e:
+        return None, f"Failed to access sheet1: {e}"
 
-    # Ensure header row exists
+    # Ensure headers
     try:
         header = ws.row_values(1)
         if not header:
             ws.append_row(SIGNAL_COLUMNS)
-    except Exception:
-        # If anything weird, just try to reset header
-        try:
-            ws.clear()
-            ws.append_row(SIGNAL_COLUMNS)
-        except Exception:
-            return None
+        else:
+            # If existing header differs, we won't destroy it; we just warn.
+            if header[: len(SIGNAL_COLUMNS)] != SIGNAL_COLUMNS:
+                # Attempt safe fix only if header is empty-ish
+                if len(header) < len(SIGNAL_COLUMNS):
+                    ws.update("A1", [SIGNAL_COLUMNS])
+    except Exception as e:
+        return None, f"Failed to ensure headers: {e}"
 
-    return ws
+    return ws, None
 
 
-def persist_and_get_recent_signals(
-    df_cont: pd.DataFrame,
-    df_rev: pd.DataFrame,
-    now_ist: datetime,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+def fetch_existing_keys_recent(ws, days_back: int = 3) -> set:
     """
-    Persist current signals to Google Sheet and return two DataFrames:
-      - recent continuation signals (last 24h, dedup by symbol+mode)
-      - recent reversal signals (last 24h, dedup by symbol+mode)
-    If sheet is not available, just return inputs (current scan only).
+    Pull recent keys to dedup without reading entire sheet forever.
+    If sheet is small, get_all_records is fine; else we filter by time.
     """
-    ws = get_signals_worksheet()
-    if ws is None:
-        # Persistence not available => behave like old version
-        return df_cont, df_rev
-
-    # Build new rows from current scan
-    new_rows = []
-
-    ts_str = now_ist.strftime("%Y-%m-%d %H:%M:%S")
-
-    if not df_cont.empty:
-        for _, r in df_cont.iterrows():
-            new_rows.append(
-                [
-                    ts_str,
-                    r["Symbol"],
-                    "Continuation",
-                    r["Bias"],
-                    r["LTP"],
-                    r["BBW"],
-                    r["BBW %Rank (20)"],
-                    r["RSI"],
-                    r["ADX"],
-                    r["Trend"],
-                    r["Setup"],
-                ]
-            )
-
-    if not df_rev.empty:
-        for _, r in df_rev.iterrows():
-            new_rows.append(
-                [
-                    ts_str,
-                    r["Symbol"],
-                    "Reversal",
-                    r["Bias"],
-                    r["LTP"],
-                    r["BBW"],
-                    r["BBW %Rank (20)"],
-                    r["RSI"],
-                    r["ADX"],
-                    r["Trend"],
-                    r["Setup"],
-                ]
-            )
-
-    # Fetch existing rows
     try:
         records = ws.get_all_records()
     except Exception:
-        return df_cont, df_rev
+        return set()
 
-    if records:
-        df_existing = pd.DataFrame(records)
-    else:
-        df_existing = pd.DataFrame(columns=SIGNAL_COLUMNS)
+    if not records:
+        return set()
 
-    # Append new rows to sheet (persistent store)
-    if new_rows:
-        try:
-            ws.append_rows(new_rows)
-        except Exception:
-            # Even if append fails, we can still use existing for display
-            pass
+    df = pd.DataFrame(records)
+    if "key" not in df.columns or "signal_time" not in df.columns:
+        # legacy data; no dedup keys
+        return set(df.get("key", pd.Series(dtype=str)).astype(str).tolist())
 
-    # Build full DF for last 24h view (existing + newly created)
-    df_new = pd.DataFrame(new_rows, columns=SIGNAL_COLUMNS) if new_rows else pd.DataFrame(columns=SIGNAL_COLUMNS)
-
-    if df_existing.empty and df_new.empty:
-        return df_cont, df_rev
-
-    df_all = pd.concat([df_existing, df_new], ignore_index=True)
-
-    # Parse timestamp
+    # parse signal_time
     try:
-        df_all["timestamp"] = pd.to_datetime(df_all["timestamp"])
+        df["signal_time_dt"] = pd.to_datetime(df["signal_time"], errors="coerce")
     except Exception:
-        # If parsing fails, bail out to current-only
-        return df_cont, df_rev
+        df["signal_time_dt"] = pd.NaT
 
-    # Filter last 24 hours (in IST, but timestamps stored without tz)
-    cutoff = now_ist.replace(tzinfo=None) - timedelta(hours=24)
-    df_recent = df_all[df_all["timestamp"] >= cutoff].copy()
+    cutoff = now_ist().replace(tzinfo=None) - timedelta(days=days_back)
+    df = df[df["signal_time_dt"].notna()]
+    df = df[df["signal_time_dt"] >= cutoff]
 
-    if df_recent.empty:
-        return df_cont, df_rev
+    return set(df["key"].astype(str).tolist())
 
-    # Build continuation and reversal views
-    df_cont_recent = df_recent[df_recent["mode"] == "Continuation"].copy()
-    df_rev_recent = df_recent[df_recent["mode"] == "Reversal"].copy()
 
-    # Deduplicate by symbol+mode, keep latest timestamp
-    if not df_cont_recent.empty:
-        df_cont_recent = df_cont_recent.sort_values("timestamp", ascending=False)
-        df_cont_recent = df_cont_recent.drop_duplicates(subset=["symbol", "mode"], keep="first")
-        df_cont_recent["Timestamp"] = df_cont_recent["timestamp"].dt.strftime("%d-%b-%Y %H:%M")
-        df_cont_recent.rename(
-            columns={
-                "symbol": "Symbol",
-                "bias": "Bias",
-                "ltp": "LTP",
-                "bbw": "BBW",
-                "bbw_pct_rank": "BBW %Rank (20)",
-                "rsi": "RSI",
-                "adx": "ADX",
-                "trend": "Trend",
-                "setup": "Setup",
-            },
-            inplace=True,
-        )
-        df_cont_display = df_cont_recent[
-            [
-                "Timestamp",
-                "Symbol",
-                "Bias",
-                "LTP",
-                "BBW",
-                "BBW %Rank (20)",
-                "RSI",
-                "ADX",
-                "Trend",
-                "Setup",
-            ]
-        ]
-    else:
-        df_cont_display = pd.DataFrame(
-            columns=["Timestamp", "Symbol", "Bias", "LTP", "BBW", "BBW %Rank (20)", "RSI", "ADX", "Trend", "Setup"]
-        )
+def append_signals(ws, rows: list[list], show_debug: bool = False) -> tuple[int, str | None]:
+    if not rows:
+        return 0, None
+    try:
+        ws.append_rows(rows, value_input_option="USER_ENTERED")
+        return len(rows), None
+    except APIError as e:
+        if show_debug:
+            return 0, f"Sheets APIError: {e}"
+        return 0, "Sheets write failed (APIError)."
+    except Exception as e:
+        if show_debug:
+            return 0, f"Sheets write failed: {e}"
+        return 0, "Sheets write failed."
 
-    if not df_rev_recent.empty:
-        df_rev_recent = df_rev_recent.sort_values("timestamp", ascending=False)
-        df_rev_recent = df_rev_recent.drop_duplicates(subset=["symbol", "mode"], keep="first")
-        df_rev_recent["Timestamp"] = df_rev_recent["timestamp"].dt.strftime("%d-%b-%Y %H:%M")
-        df_rev_recent.rename(
-            columns={
-                "symbol": "Symbol",
-                "bias": "Bias",
-                "ltp": "LTP",
-                "bbw": "BBW",
-                "bbw_pct_rank": "BBW %Rank (20)",
-                "rsi": "RSI",
-                "adx": "ADX",
-                "trend": "Trend",
-                "setup": "Setup",
-            },
-            inplace=True,
-        )
-        df_rev_display = df_rev_recent[
-            [
-                "Timestamp",
-                "Symbol",
-                "Bias",
-                "LTP",
-                "BBW",
-                "BBW %Rank (20)",
-                "RSI",
-                "ADX",
-                "Trend",
-                "Setup",
-            ]
-        ]
-    else:
-        df_rev_display = pd.DataFrame(
-            columns=["Timestamp", "Symbol", "Bias", "LTP", "BBW", "BBW %Rank (20)", "RSI", "ADX", "Trend", "Setup"]
-        )
 
-    return df_cont_display, df_rev_display
+def load_recent_signals(ws, hours: int = 24) -> pd.DataFrame:
+    try:
+        records = ws.get_all_records()
+    except Exception:
+        return pd.DataFrame()
 
+    if not records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+
+    # Ensure expected columns exist
+    for c in SIGNAL_COLUMNS:
+        if c not in df.columns:
+            df[c] = None
+
+    # Parse signal_time
+    df["signal_time_dt"] = pd.to_datetime(df["signal_time"], errors="coerce")
+    df = df[df["signal_time_dt"].notna()]
+
+    cutoff = now_ist().replace(tzinfo=None) - timedelta(hours=hours)
+    df = df[df["signal_time_dt"] >= cutoff].copy()
+    if df.empty:
+        return df
+
+    # display-friendly
+    df["Timestamp"] = df["signal_time_dt"].dt.strftime("%d-%b-%Y %H:%M")
+    df.rename(
+        columns={
+            "symbol": "Symbol",
+            "mode": "Mode",
+            "setup": "Setup",
+            "bias": "Bias",
+            "ltp": "LTP",
+            "bbw": "BBW",
+            "bbw_pct_rank": "BBW %Rank (20)",
+            "rsi": "RSI",
+            "adx": "ADX",
+            "trend": "Trend",
+        },
+        inplace=True,
+    )
+
+    # Dedup display: keep latest signal per Symbol+Mode
+    df = df.sort_values("signal_time_dt", ascending=False)
+    df = df.drop_duplicates(subset=["Symbol", "Mode"], keep="first")
+
+    cols = [
+        "Timestamp",
+        "Symbol",
+        "Mode",
+        "Bias",
+        "LTP",
+        "BBW",
+        "BBW %Rank (20)",
+        "RSI",
+        "ADX",
+        "Trend",
+        "Setup",
+    ]
+    return df[cols]
+
+
+# ======================
+#  Backtest (coherent signal timestamps)
+# ======================
 
 def backtest_trend_squeeze(
     df: pd.DataFrame,
@@ -479,52 +414,31 @@ def backtest_trend_squeeze(
     atr_mult: float = 2.0,
 ) -> pd.DataFrame:
     """
-    Backtest Trend + Squeeze with:
-      - Hybrid trailing stop based on Supertrend + ATR
-      - RSI-based profit target
-      - Time-based exit fallback
-
-    trade_mode:
-      - "Continuation": Bullish Squeeze = LONG, Bearish Squeeze = SHORT
-      - "Reversal":     Bullish Squeeze = SHORT, Bearish Squeeze = LONG
-
-    Entry: next bar’s open after signal.
-    Exit: first of
-      - TARGET_RSI
-      - TRAIL_STOP_HYBRID (Supertrend + ATR trailing stop)
-      - TIME_EXIT
+    Coherent backtest:
+      - Signals are taken from df_prepped where setup != "" (same as Live logic)
+      - Entry: next candle open
+      - Exits:
+          1) RSI target
+          2) Supertrend+ATR hybrid trailing stop
+          3) Time exit
     """
 
-    # 1) Compute squeeze/trend logic
     df_prepped = prepare_trend_squeeze(
         df,
         bbw_abs_threshold=bbw_abs_threshold,
         bbw_pct_threshold=bbw_pct_threshold,
     )
-
-    # 2) Ensure RSI
     df_prepped = ensure_rsi(df_prepped)
-
-    # 3) Supertrend
     df_prepped = compute_supertrend(df_prepped, period=st_period, multiplier=st_mult)
-
-    # 4) ATR
     df_prepped = compute_atr(df_prepped, period=atr_period)
 
     signals = df_prepped[df_prepped["setup"] != ""].copy()
     if signals.empty:
         return pd.DataFrame(
             columns=[
-                "symbol",
-                "signal_time",
-                "entry_time",
-                "exit_time",
-                "setup",
-                "direction",
-                "exit_reason",
-                "entry_price",
-                "exit_price",
-                "return_pct",
+                "symbol", "signal_time", "entry_time", "exit_time",
+                "setup", "direction", "exit_reason",
+                "entry_price", "exit_price", "return_pct",
             ]
         )
 
@@ -539,17 +453,15 @@ def backtest_trend_squeeze(
 
         entry_idx = idx + 1
         if entry_idx >= len(indexed_df):
-            continue  # can't enter on last bar
+            continue
 
         max_exit_idx = min(entry_idx + hold_bars - 1, len(indexed_df) - 1)
         setup = signals.loc[ts, "setup"]
 
-        # Direction depends on trade_mode
+        # Direction mapping must match Live exactly
         if trade_mode == "Reversal":
-            # Fade the signal: Bearish → LONG, Bullish → SHORT
             is_long = (setup == "Bearish Squeeze")
         else:
-            # Continuation: follow the label
             is_long = (setup == "Bullish Squeeze")
 
         direction = 1 if is_long else -1
@@ -557,21 +469,20 @@ def backtest_trend_squeeze(
         entry_time = indexed_df.index[entry_idx]
         entry_price = indexed_df["open"].iloc[entry_idx]
 
-        # Initial ATR & stop
         entry_atr = indexed_df["atr"].iloc[entry_idx]
         if np.isnan(entry_atr) or entry_atr <= 0:
-            # skip trades with undefined ATR
             continue
 
-        if is_long:
-            trail_stop = entry_price - atr_mult * entry_atr
-        else:
-            trail_stop = entry_price + atr_mult * entry_atr
+        # initial hybrid stop using ATR
+        trail_stop = (
+            entry_price - atr_mult * entry_atr
+            if is_long
+            else entry_price + atr_mult * entry_atr
+        )
 
         exit_idx = max_exit_idx
         exit_reason = "TIME_EXIT"
 
-        # Walk bar by bar
         for j in range(entry_idx, max_exit_idx + 1):
             row = indexed_df.iloc[j]
             c = row["close"]
@@ -579,58 +490,41 @@ def backtest_trend_squeeze(
             st_line = row["supertrend"]
             atr_val = row["atr"]
 
-            # --- Update hybrid trailing stop ---
-            if not np.isnan(st_line) and not np.isnan(atr_val) and atr_val > 0:
+            # update hybrid stop
+            if pd.notna(st_line) and pd.notna(atr_val) and atr_val > 0:
                 if is_long:
-                    # Tightest stop: min(supertrend, price - ATR*mult)
-                    candidate_st = st_line
-                    candidate_atr = c - atr_mult * atr_val
-                    proposed_stop = min(candidate_st, candidate_atr)
-                    # Trail only upwards
-                    trail_stop = max(trail_stop, proposed_stop)
+                    proposed = min(st_line, c - atr_mult * atr_val)
+                    trail_stop = max(trail_stop, proposed)  # only tighter upward
                 else:
-                    # SHORT: tightest stop above price
-                    candidate_st = st_line
-                    candidate_atr = c + atr_mult * atr_val
-                    proposed_stop = max(candidate_st, candidate_atr)
-                    # Trail only downwards
-                    trail_stop = min(trail_stop, proposed_stop)
+                    proposed = max(st_line, c + atr_mult * atr_val)
+                    trail_stop = min(trail_stop, proposed)  # only tighter downward
 
-            # --- Exit logic priority ---
-
+            # exit priority
             if is_long:
-                # 1) RSI target
                 if rsi >= rsi_long_target:
-                    exit_idx = j
-                    exit_reason = "TARGET_RSI"
+                    exit_idx, exit_reason = j, "TARGET_RSI"
                     break
-                # 2) Hybrid trail stop
                 if c <= trail_stop:
-                    exit_idx = j
-                    exit_reason = "TRAIL_STOP_HYBRID"
+                    exit_idx, exit_reason = j, "TRAIL_STOP_HYBRID"
                     break
             else:
-                # SHORT
                 if rsi <= rsi_short_target:
-                    exit_idx = j
-                    exit_reason = "TARGET_RSI"
+                    exit_idx, exit_reason = j, "TARGET_RSI"
                     break
                 if c >= trail_stop:
-                    exit_idx = j
-                    exit_reason = "TRAIL_STOP_HYBRID"
+                    exit_idx, exit_reason = j, "TRAIL_STOP_HYBRID"
                     break
 
         exit_time = indexed_df.index[exit_idx]
         exit_price = indexed_df["close"].iloc[exit_idx]
-
         ret_pct = direction * (exit_price / entry_price - 1.0) * 100.0
 
         trades.append(
             {
                 "symbol": symbol,
-                "signal_time": format_ts(ts),
-                "entry_time": format_ts(entry_time),
-                "exit_time": format_ts(exit_time),
+                "signal_time": fmt_ts(ts),
+                "entry_time": fmt_ts(entry_time),
+                "exit_time": fmt_ts(exit_time),
                 "setup": setup,
                 "direction": "LONG" if is_long else "SHORT",
                 "exit_reason": exit_reason,
@@ -643,165 +537,130 @@ def backtest_trend_squeeze(
     return pd.DataFrame(trades)
 
 
-# =========================
-#   PAGE HEADER
-# =========================
+# ======================
+#  UI Header
+# ======================
+
 st.title("📉 Trend Squeeze Screener & Backtester")
-st.info("⏳ Live tab auto-refreshes every 5 minutes. Backtest tab uses historical data.")
 
-now_ist = datetime.now(IST)
-mode_str = (
-    "🟢 LIVE MARKET"
-    if market_open_now()
-    else "🔵 EOD / OFF-MARKET (using last trading session data)"
-)
-st.caption(f"{mode_str} • Last refresh: {now_ist.strftime('%d %b %Y • %H:%M:%S')} IST")
+n = now_ist()
+mode_str = "🟢 LIVE MARKET" if market_open_now() else "🔵 OFF-MARKET"
+st.caption(f"{mode_str} • Last refresh: {n.strftime('%d %b %Y • %H:%M:%S')} IST")
 
-# -----------------------------
-# ⚙️ Sidebar controls
-# -----------------------------
 with st.sidebar:
     st.subheader("Settings")
     show_debug = st.checkbox("Show debug messages", value=False)
 
-# -----------------------------
-# 🔐 Zerodha credentials
-# -----------------------------
+    st.markdown("---")
+    st.subheader("Live coherence")
+    catchup_candles = st.slider(
+        "Catch-up window (candles)",
+        min_value=8,
+        max_value=64,
+        value=32,
+        step=4,
+        help="Live will scan the last N 15m candles and log any setups it finds (deduped).",
+    )
+    retention_hours = st.slider(
+        "Keep signals for (hours)",
+        min_value=6,
+        max_value=48,
+        value=24,
+        step=6,
+        help="Display window for signals from Google Sheet.",
+    )
+
+st.markdown(
+    "This app is now **coherent**: Live detects setups on candle timestamps (same as backtest) and stores them for viewing."
+)
+
+# ======================
+# Zerodha auth
+# ======================
+
 api_key, api_secret, access_token = load_credentials_from_gsheet("ZerodhaTokenStore")
 kite = KiteConnect(api_key=api_key)
 kite.set_access_token(access_token)
 
-# -----------------------------
-# 📈 NIFTY 50 stock universe
-# -----------------------------
+# ======================
+# Universe
+# ======================
 
-# Fallback list in case NSE CSV fetch fails
 fallback_nifty50 = [
-    "ADANIENT",
-    "ADANIPORTS",
-    "APOLLOHOSP",
-    "ASIANPAINT",
-    "AXISBANK",
-    "BAJAJ-AUTO",
-    "BAJFINANCE",
-    "BAJAJFINSV",
-    "BHARTIARTL",
-    "BPCL",
-    "BRITANNIA",
-    "CIPLA",
-    "COALINDIA",
-    "DIVISLAB",
-    "DRREDDY",
-    "EICHERMOT",
-    "GRASIM",
-    "HCLTECH",
-    "HDFCBANK",
-    "HINDALCO",
-    "HINDUNILVR",
-    "ICICIBANK",
-    "INDUSINDBK",
-    "INFY",
-    "ITC",
-    "JSWSTEEL",
-    "KOTAKBANK",
-    "LT",
-    "LTIM",
-    "M&M",
-    "MARUTI",
-    "NESTLEIND",
-    "NTPC",
-    "ONGC",
-    "POWERGRID",
-    "RELIANCE",
-    "SBIN",
-    "SBILIFE",
-    "SUNPHARMA",
-    "TATACONSUM",
-    "TMPV",
-    "TATASTEEL",
-    "TCS",
-    "TECHM",
-    "TITAN",
-    "ULTRACEMCO",
-    "UPL",
-    "WIPRO",
-    "HEROMOTOCO",
-    "SHREECEM",
+    "ADANIENT","ADANIPORTS","APOLLOHOSP","ASIANPAINT","AXISBANK","BAJAJ-AUTO","BAJFINANCE",
+    "BAJAJFINSV","BHARTIARTL","BPCL","BRITANNIA","CIPLA","COALINDIA","DIVISLAB","DRREDDY",
+    "EICHERMOT","GRASIM","HCLTECH","HDFCBANK","HINDALCO","HINDUNILVR","ICICIBANK","INDUSINDBK",
+    "INFY","ITC","JSWSTEEL","KOTAKBANK","LT","LTIM","M&M","MARUTI","NESTLEIND","NTPC","ONGC",
+    "POWERGRID","RELIANCE","SBIN","SBILIFE","SUNPHARMA","TATACONSUM","TMPV","TATASTEEL","TCS",
+    "TECHM","TITAN","ULTRACEMCO","UPL","WIPRO","HEROMOTOCO","SHREECEM"
 ]
 
-# Try to fetch live NIFTY50 list from NSE
-live_nifty50 = fetch_nifty50_symbols()
+symbols_live = fetch_nifty50_symbols()
+stock_list = symbols_live if symbols_live and len(symbols_live) >= 45 else fallback_nifty50
+st.caption(f"Universe: NIFTY50 ({len(stock_list)} symbols).")
 
-INVALID_SYMBOLS = {"DUMMYHDLVR", "DUMMY1", "DUMMY2", "DUMMY"}
+# ======================
+# Shared squeeze thresholds
+# ======================
 
-if live_nifty50:
-    clean_symbols = [
-        s
-        for s in live_nifty50
-        if s.isalpha() and "DUMMY" not in s.upper() and s not in INVALID_SYMBOLS
-    ]
-
-    if len(clean_symbols) < len(live_nifty50) and show_debug:
-        st.warning(
-            "Some NSE symbols were invalid or temporary placeholders and were removed."
-        )
-
-    stock_list = clean_symbols
-    st.caption(f"Universe: Latest NIFTY 50 from NSE (cleaned, {len(stock_list)} symbols).")
-else:
-    stock_list = fallback_nifty50
-    st.caption("Universe: Fallback hard-coded NIFTY 50 list (NSE CSV unavailable).")
-
-# -----------------------------
-# 🎯 Squeeze configuration (shared by Live + Backtest)
-# -----------------------------
-col1, col2 = st.columns(2)
-with col1:
+c1, c2 = st.columns(2)
+with c1:
     bbw_abs_threshold = st.slider(
         "BBW absolute threshold (max BBW)",
-        0.01,
-        0.20,
-        0.05,
-        step=0.005,
-        help="Maximum allowed BBW. Lower = tighter squeeze.",
+        0.01, 0.20, 0.05, step=0.005,
+        help="Lower = tighter squeeze."
     )
-with col2:
+with c2:
     bbw_pct_threshold = st.slider(
         "BBW percentile threshold",
-        0.10,
-        0.80,
-        0.35,
-        step=0.05,
-        help="BBW must be in the bottom X% of last 20 bars.",
+        0.10, 0.80, 0.35, step=0.05,
+        help="BBW must be in the bottom X% of last 20 bars."
     )
 
-st.caption(
-    "Squeeze = Bollinger inside Keltner AND BBW below both the absolute "
-    "threshold and the rolling percentile threshold."
-)
+# ======================
+# Tokens
+# ======================
 
-# -----------------------------
-# 🧩 Instrument tokens (shared)
-# -----------------------------
 instrument_token_map = build_instrument_token_map(kite, stock_list)
 
-# =========================
-#   TABS: LIVE / BACKTEST
-# =========================
+# ======================
+# Tabs
+# ======================
+
 live_tab, backtest_tab = st.tabs(["📺 Live Screener", "📜 Backtest"])
 
+# ======================
+# LIVE TAB (catch-up scan + dedup + sheet health)
+# ======================
 
-# =========================
-#   LIVE SCREENER TAB
-# =========================
 with live_tab:
-    continuation_rows: list[dict] = []
-    reversal_rows: list[dict] = []
+    st.subheader("📺 Live Screener (Catch-up + 24h memory)")
 
-    if show_debug:
-        st.info("📊 Fetching and analyzing NIFTY 50 stocks (live). Please wait...")
-    else:
-        st.info("📊 Scanning NIFTY 50 (live)... showing continuation and reversal candidates (last 24h).")
+    ws, ws_err = get_signals_worksheet()
+    health_col1, health_col2 = st.columns([1, 4])
+
+    with health_col1:
+        if ws_err:
+            st.error("Sheets ❌")
+        else:
+            st.success("Sheets ✅")
+
+    with health_col2:
+        if ws_err:
+            st.caption(ws_err)
+        else:
+            st.caption(f"Using Google Sheet: **{SIGNAL_SHEET_NAME}** (sheet1)")
+
+    # If sheet is unavailable, we still show current-detection; but coherence requires sheet.
+    existing_keys = set()
+    if ws and not ws_err:
+        existing_keys = fetch_existing_keys_recent(ws, days_back=3)
+
+    # --- Scan & build signal rows (from candle timestamps) ---
+    rows_to_append = []
+    signals_found = 0
+
+    logged_at = fmt_dt(now_ist())
 
     for symbol in stock_list:
         token = instrument_token_map.get(symbol)
@@ -811,12 +670,8 @@ with live_tab:
             continue
 
         try:
-            df = get_ohlc_15min(kite, token, show_debug=show_debug)
-
+            df = get_ohlc_15min(kite, token, show_debug=False)
             if df is None or df.shape[0] < 60:
-                if show_debug:
-                    count = 0 if df is None else df.shape[0]
-                    st.warning(f"{symbol}: Only {count} candles available — skipping.")
                 continue
 
             df_prepped = prepare_trend_squeeze(
@@ -825,83 +680,104 @@ with live_tab:
                 bbw_pct_threshold=bbw_pct_threshold,
             )
 
-            if df_prepped.isnull().values.any():
-                if show_debug:
-                    st.warning(f"{symbol}: Indicators contain NaNs — skipping.")
+            # Scan last N candles to avoid missing setups when app wasn't open
+            recent = df_prepped.tail(int(catchup_candles)).copy()
+            recent = recent[recent["setup"] != ""]
+            if recent.empty:
                 continue
 
-            latest = df_prepped.iloc[-1]
+            for candle_ts, r in recent.iterrows():
+                # Candle timestamp is the truth
+                signal_time = ts_to_sheet_str(candle_ts)
 
-            setup = latest["setup"]
-            if not setup:
-                continue
+                setup = r["setup"]
+                trend = r.get("trend", "")
+                ltp = float(r.get("close", np.nan))
+                bbw = float(r.get("bbw", np.nan))
+                bbw_rank = r.get("bbw_pct_rank", np.nan)
+                rsi = float(r.get("rsi", np.nan))
+                adx = float(r.get("adx", np.nan))
 
-            # Common fields
-            base_row = {
-                "Symbol": symbol,
-                "LTP": round(latest["close"], 2),
-                "BBW": round(latest["bbw"], 4),
-                "BBW %Rank (20)": round(latest["bbw_pct_rank"], 2)
-                if pd.notna(latest["bbw_pct_rank"])
-                else None,
-                "RSI": round(latest["rsi"], 1),
-                "ADX": round(latest["adx"], 1),
-                "Trend": latest["trend"],
-                "Setup": setup,
-            }
+                # Continuation
+                cont_bias = "LONG" if setup == "Bullish Squeeze" else "SHORT"
+                cont_key = f"{symbol}|Continuation|{signal_time}|{setup}|{cont_bias}"
+                if cont_key not in existing_keys:
+                    rows_to_append.append([
+                        cont_key, signal_time, logged_at, symbol, "Continuation", setup, cont_bias,
+                        ltp, bbw, bbw_rank, rsi, adx, trend
+                    ])
+                    existing_keys.add(cont_key)
+                    signals_found += 1
 
-            # Continuation interpretation (with trend)
-            cont_direction = "LONG" if setup == "Bullish Squeeze" else "SHORT"
-            cont_row = base_row.copy()
-            cont_row["Bias"] = cont_direction
-            continuation_rows.append(cont_row)
-
-            # Reversal interpretation (against trend)
-            rev_direction = "LONG" if setup == "Bearish Squeeze" else "SHORT"
-            rev_row = base_row.copy()
-            rev_row["Bias"] = rev_direction
-            reversal_rows.append(rev_row)
+                # Reversal
+                rev_bias = "LONG" if setup == "Bearish Squeeze" else "SHORT"
+                rev_key = f"{symbol}|Reversal|{signal_time}|{setup}|{rev_bias}"
+                if rev_key not in existing_keys:
+                    rows_to_append.append([
+                        rev_key, signal_time, logged_at, symbol, "Reversal", setup, rev_bias,
+                        ltp, bbw, bbw_rank, rsi, adx, trend
+                    ])
+                    existing_keys.add(rev_key)
+                    signals_found += 1
 
         except Exception as e:
             if show_debug:
-                st.warning(f"{symbol}: Failed to fetch or compute — {str(e)}")
+                st.warning(f"{symbol}: error -> {e}")
             continue
 
-    # Current scan DataFrames (in case sheet is not available)
-    df_cont_current = pd.DataFrame(continuation_rows) if continuation_rows else pd.DataFrame(
-        columns=["Symbol", "LTP", "BBW", "BBW %Rank (20)", "RSI", "ADX", "Trend", "Setup", "Bias"]
-    )
-    df_rev_current = pd.DataFrame(reversal_rows) if reversal_rows else pd.DataFrame(
-        columns=["Symbol", "LTP", "BBW", "BBW %Rank (20)", "RSI", "ADX", "Trend", "Setup", "Bias"]
-    )
+    # Append signals (if possible)
+    appended = 0
+    append_err = None
+    if ws and not ws_err:
+        appended, append_err = append_signals(ws, rows_to_append, show_debug=show_debug)
 
-    # 🔁 Persist + show last 24h view
-    df_cont_display, df_rev_display = persist_and_get_recent_signals(
-        df_cont_current,
-        df_rev_current,
-        now_ist,
-    )
-
-    # Show continuation table
-    st.markdown("### 🔵 Continuation Setups (with trend) – last 24 hours")
-    if not df_cont_display.empty:
-        st.success(f"{len(df_cont_display)} continuation candidates in the last 24 hours.")
-        st.dataframe(df_cont_display, use_container_width=True)
+    if ws_err:
+        st.warning(
+            "Google Sheet not available, so Live will only show what it detects right now. "
+            "Coherence requires sheet access."
+        )
     else:
-        st.info("No continuation setups in the last 24 hours.")
+        if append_err:
+            st.warning(f"Could not write signals to sheet: {append_err}")
+        else:
+            st.caption(f"Logged **{appended}** new signals this refresh (deduped).")
 
-    # Show reversal table
-    st.markdown("### 🟠 Reversal Setups (against trend) – last 24 hours")
-    if not df_rev_display.empty:
-        st.success(f"{len(df_rev_display)} reversal candidates in the last 24 hours.")
-        st.dataframe(df_rev_display, use_container_width=True)
+    # Load and show last 24h window (the user's monitoring truth)
+    if ws and not ws_err:
+        df_recent = load_recent_signals(ws, hours=int(retention_hours))
     else:
-        st.info("No reversal setups in the last 24 hours.")
+        df_recent = pd.DataFrame()
 
+    st.markdown(f"### 🧠 Signals in the last {int(retention_hours)} hours (deduped by Symbol+Mode)")
+    if df_recent is None or df_recent.empty:
+        st.info("No signals in the selected window.")
+    else:
+        # Split into continuation & reversal for clarity
+        df_cont = df_recent[df_recent["Mode"] == "Continuation"].copy()
+        df_rev = df_recent[df_recent["Mode"] == "Reversal"].copy()
 
-# =========================
-#   BACKTEST TAB
-# =========================
+        st.markdown("#### 🔵 Continuation (with trend)")
+        if df_cont.empty:
+            st.info("No continuation signals in the selected window.")
+        else:
+            st.dataframe(df_cont, use_container_width=True)
+
+        st.markdown("#### 🟠 Reversal (against trend)")
+        if df_rev.empty:
+            st.info("No reversal signals in the selected window.")
+        else:
+            st.dataframe(df_rev, use_container_width=True)
+
+    st.markdown("---")
+    st.caption(
+        "Why this fixes your mismatch: Live now scans the last N candles every refresh and logs signals by candle timestamp. "
+        "Backtest and Live are now referring to the same events."
+    )
+
+# ======================
+# BACKTEST TAB
+# ======================
+
 with backtest_tab:
     st.subheader("📜 Trend Squeeze Backtest (15-minute)")
 
@@ -914,113 +790,58 @@ with backtest_tab:
         with col_bt1:
             lookback_days = st.slider(
                 "Lookback period (days)",
-                min_value=10,
-                max_value=120,
-                value=60,
-                step=5,
-                help="Number of calendar days of 15-minute history to use.",
+                min_value=10, max_value=120, value=60, step=5,
+                help="Calendar days of 15-minute history."
             )
         with col_bt2:
             hold_bars = st.slider(
                 "Max holding period (bars)",
-                min_value=2,
-                max_value=24,
-                value=8,
-                step=1,
-                help="Maximum number of 15-minute bars to hold after entry.",
+                min_value=2, max_value=24, value=8, step=1,
+                help="15-minute bars to hold after entry."
             )
 
         col_st1, col_st2 = st.columns(2)
         with col_st1:
-            st_period = st.slider(
-                "Supertrend period",
-                min_value=7,
-                max_value=20,
-                value=10,
-                step=1,
-            )
+            st_period = st.slider("Supertrend period", 7, 20, 10, 1)
         with col_st2:
-            st_mult = st.slider(
-                "Supertrend multiplier",
-                min_value=1.5,
-                max_value=4.0,
-                value=3.0,
-                step=0.5,
-            )
+            st_mult = st.slider("Supertrend multiplier", 1.5, 4.0, 3.0, 0.5)
 
         col_atr1, col_atr2 = st.columns(2)
         with col_atr1:
-            atr_period = st.slider(
-                "ATR period",
-                min_value=7,
-                max_value=30,
-                value=14,
-                step=1,
-            )
+            atr_period = st.slider("ATR period", 7, 30, 14, 1)
         with col_atr2:
-            atr_mult = st.slider(
-                "ATR multiple for hybrid stop",
-                min_value=0.5,
-                max_value=4.0,
-                value=2.0,
-                step=0.25,
-            )
+            atr_mult = st.slider("ATR multiple for hybrid stop", 0.5, 4.0, 2.0, 0.25)
 
         col_rsi1, col_rsi2 = st.columns(2)
         with col_rsi1:
-            rsi_long_target = st.slider(
-                "RSI target for LONG",
-                min_value=55,
-                max_value=80,
-                value=70,
-                step=1,
-            )
+            rsi_long_target = st.slider("RSI target for LONG", 55, 80, 70, 1)
         with col_rsi2:
-            rsi_short_target = st.slider(
-                "RSI target for SHORT",
-                min_value=20,
-                max_value=45,
-                value=30,
-                step=1,
-            )
+            rsi_short_target = st.slider("RSI target for SHORT", 20, 45, 30, 1)
 
-        # 🔁 Trade mode – follow trend vs fade trend
         trade_mode_label = st.radio(
             "How to trade the squeeze?",
-            options=[
-                "Continuation (with trend)",
-                "Reversal (against trend)",
-            ],
+            options=["Continuation (with trend)", "Reversal (against trend)"],
             index=0,
-            help="Reversal may work better for some stocks; test both.",
         )
         trade_mode = "Continuation" if "Continuation" in trade_mode_label else "Reversal"
 
-        run_bt = st.button("Run Backtest")
-
-        if run_bt:
+        if st.button("Run Backtest"):
             token = instrument_token_map.get(bt_symbol)
             if not token:
                 st.error(f"No instrument token found for {bt_symbol}.")
             else:
-                st.info(
-                    f"Running {trade_mode.lower()} backtest for {bt_symbol} with "
-                    f"{lookback_days} days of 15m data..."
-                )
+                st.info(f"Backtesting {bt_symbol} ({trade_mode}) with last {lookback_days} days 15m data...")
 
                 df_bt = get_ohlc_15min(
                     kite,
                     token,
                     lookback_days=lookback_days,
                     min_candles=60,
-                    show_debug=show_debug,
+                    show_debug=False,
                 )
 
                 if df_bt is None or df_bt.shape[0] < 60:
-                    st.error(
-                        f"Not enough data to backtest {bt_symbol}. "
-                        f"Got {0 if df_bt is None else df_bt.shape[0]} candles."
-                    )
+                    st.error("Not enough data to run backtest.")
                 else:
                     trades = backtest_trend_squeeze(
                         df_bt,
@@ -1038,26 +859,17 @@ with backtest_tab:
                     )
 
                     if trades.empty:
-                        st.warning(
-                            "No Trend Squeeze signals found in the selected period "
-                            "for this symbol with current thresholds."
-                        )
+                        st.warning("No signals found in the selected period with current thresholds.")
                     else:
-                        total_trades = len(trades)
+                        total = len(trades)
                         wins = (trades["return_pct"] > 0).sum()
-                        losses = (trades["return_pct"] <= 0).sum()
-                        win_rate = (wins / total_trades) * 100.0
+                        win_rate = (wins / total) * 100.0
                         avg_ret = trades["return_pct"].mean()
                         best = trades["return_pct"].max()
                         worst = trades["return_pct"].min()
 
-                        st.success(
-                            f"Generated {total_trades} trades for {bt_symbol} "
-                            f"over last {lookback_days} days in {trade_mode} mode."
-                        )
-
                         m1, m2, m3, m4 = st.columns(4)
-                        m1.metric("Total trades", total_trades)
+                        m1.metric("Total trades", total)
                         m2.metric("Win rate (%)", f"{win_rate:.1f}")
                         m3.metric("Avg return / trade (%)", f"{avg_ret:.2f}")
                         m4.metric("Best / Worst (%)", f"{best:.2f} / {worst:.2f}")
