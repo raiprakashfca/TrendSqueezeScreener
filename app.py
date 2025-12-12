@@ -31,13 +31,13 @@ MARKET_CLOSE = time(15, 30)
 
 SIGNAL_SHEET_NAME = "TrendSqueezeSignals"
 
-# ✅ new schema (includes KEY + candle-time)
+# ✅ Continuation-only schema (Mode is always "Continuation")
 SIGNAL_COLUMNS = [
     "key",              # unique dedup key
     "signal_time",      # candle timestamp (IST naive string)
     "logged_at",        # when app logged it (IST naive string)
     "symbol",
-    "mode",             # Continuation / Reversal
+    "mode",             # always "Continuation"
     "setup",            # Bullish Squeeze / Bearish Squeeze
     "bias",             # LONG / SHORT
     "ltp",
@@ -59,12 +59,11 @@ def market_open_now() -> bool:
 
 
 def fmt_dt(dt: datetime) -> str:
-    # store sheet timestamps without tz noise
     return dt.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def fmt_ts(ts) -> str:
-    # convert pandas timestamp to nice display string
+    """Pretty display time for backtest output."""
     if isinstance(ts, pd.Timestamp):
         try:
             if ts.tzinfo is not None:
@@ -76,14 +75,17 @@ def fmt_ts(ts) -> str:
 
 
 def ts_to_sheet_str(ts) -> str:
-    # store as YYYY-MM-DD HH:MM:SS (IST naive)
+    """Store as YYYY-MM-DD HH:MM:SS (IST naive) in Google Sheet."""
     if isinstance(ts, pd.Timestamp):
         try:
             if ts.tzinfo is not None:
                 ts = ts.tz_convert("Asia/Kolkata")
+                ts = ts.tz_localize(None)
         except Exception:
             pass
-        return ts.tz_localize(None).strftime("%Y-%m-%d %H:%M:%S") if ts.tzinfo is None else ts.strftime("%Y-%m-%d %H:%M:%S")
+        if getattr(ts, "tzinfo", None) is not None:
+            ts = ts.tz_localize(None)
+        return ts.strftime("%Y-%m-%d %H:%M:%S")
     if isinstance(ts, datetime):
         return ts.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
     return str(ts)
@@ -116,7 +118,7 @@ def fetch_nifty50_symbols() -> list[str] | None:
 
     symbols = sorted(df["Symbol"].astype(str).str.strip().dropna().unique().tolist())
 
-    # Mapping you requested
+    # Mapping you requested earlier
     if "TATAMOTORS" in symbols and "TMPV" not in symbols:
         symbols = ["TMPV" if s == "TATAMOTORS" else s for s in symbols]
 
@@ -128,7 +130,7 @@ def fetch_nifty50_symbols() -> list[str] | None:
 
 
 # ======================
-#  Indicators for backtest exits
+#  Indicators for exits (backtest)
 # ======================
 
 def compute_supertrend(df: pd.DataFrame, period: int = 10, multiplier: float = 3.0) -> pd.DataFrame:
@@ -268,15 +270,13 @@ def get_signals_worksheet():
     except Exception as e:
         return None, f"Failed to access sheet1: {e}"
 
-    # Ensure headers
+    # Ensure headers exist
     try:
         header = ws.row_values(1)
         if not header:
             ws.append_row(SIGNAL_COLUMNS)
         else:
-            # If existing header differs, we won't destroy it; we just warn.
             if header[: len(SIGNAL_COLUMNS)] != SIGNAL_COLUMNS:
-                # Attempt safe fix only if header is empty-ish
                 if len(header) < len(SIGNAL_COLUMNS):
                     ws.update("A1", [SIGNAL_COLUMNS])
     except Exception as e:
@@ -286,10 +286,7 @@ def get_signals_worksheet():
 
 
 def fetch_existing_keys_recent(ws, days_back: int = 3) -> set:
-    """
-    Pull recent keys to dedup without reading entire sheet forever.
-    If sheet is small, get_all_records is fine; else we filter by time.
-    """
+    """Dedup keys from recent history (avoid reading ancient sheet forever)."""
     try:
         records = ws.get_all_records()
     except Exception:
@@ -300,15 +297,9 @@ def fetch_existing_keys_recent(ws, days_back: int = 3) -> set:
 
     df = pd.DataFrame(records)
     if "key" not in df.columns or "signal_time" not in df.columns:
-        # legacy data; no dedup keys
         return set(df.get("key", pd.Series(dtype=str)).astype(str).tolist())
 
-    # parse signal_time
-    try:
-        df["signal_time_dt"] = pd.to_datetime(df["signal_time"], errors="coerce")
-    except Exception:
-        df["signal_time_dt"] = pd.NaT
-
+    df["signal_time_dt"] = pd.to_datetime(df["signal_time"], errors="coerce")
     cutoff = now_ist().replace(tzinfo=None) - timedelta(days=days_back)
     df = df[df["signal_time_dt"].notna()]
     df = df[df["signal_time_dt"] >= cutoff]
@@ -323,16 +314,13 @@ def append_signals(ws, rows: list[list], show_debug: bool = False) -> tuple[int,
         ws.append_rows(rows, value_input_option="USER_ENTERED")
         return len(rows), None
     except APIError as e:
-        if show_debug:
-            return 0, f"Sheets APIError: {e}"
-        return 0, "Sheets write failed (APIError)."
+        return 0, f"Sheets APIError: {e}" if show_debug else "Sheets write failed (APIError)."
     except Exception as e:
-        if show_debug:
-            return 0, f"Sheets write failed: {e}"
-        return 0, "Sheets write failed."
+        return 0, f"Sheets write failed: {e}" if show_debug else "Sheets write failed."
 
 
 def load_recent_signals(ws, hours: int = 24) -> pd.DataFrame:
+    """Load and display last X hours of signals; deduped by Symbol (Continuation only)."""
     try:
         records = ws.get_all_records()
     except Exception:
@@ -343,22 +331,19 @@ def load_recent_signals(ws, hours: int = 24) -> pd.DataFrame:
 
     df = pd.DataFrame(records)
 
-    # Ensure expected columns exist
     for c in SIGNAL_COLUMNS:
         if c not in df.columns:
             df[c] = None
 
-    # Parse signal_time
     df["signal_time_dt"] = pd.to_datetime(df["signal_time"], errors="coerce")
     df = df[df["signal_time_dt"].notna()]
-
     cutoff = now_ist().replace(tzinfo=None) - timedelta(hours=hours)
     df = df[df["signal_time_dt"] >= cutoff].copy()
     if df.empty:
         return df
 
-    # display-friendly
     df["Timestamp"] = df["signal_time_dt"].dt.strftime("%d-%b-%Y %H:%M")
+
     df.rename(
         columns={
             "symbol": "Symbol",
@@ -375,9 +360,12 @@ def load_recent_signals(ws, hours: int = 24) -> pd.DataFrame:
         inplace=True,
     )
 
-    # Dedup display: keep latest signal per Symbol+Mode
+    # Continuation only, but keep it explicit
+    df = df[df["Mode"] == "Continuation"].copy()
+
+    # Dedup display: keep latest per Symbol
     df = df.sort_values("signal_time_dt", ascending=False)
-    df = df.drop_duplicates(subset=["Symbol", "Mode"], keep="first")
+    df = df.drop_duplicates(subset=["Symbol"], keep="first")
 
     cols = [
         "Timestamp",
@@ -396,7 +384,7 @@ def load_recent_signals(ws, hours: int = 24) -> pd.DataFrame:
 
 
 # ======================
-#  Backtest (coherent signal timestamps)
+#  Backtest (Continuation only)
 # ======================
 
 def backtest_trend_squeeze(
@@ -409,18 +397,19 @@ def backtest_trend_squeeze(
     st_mult: float,
     rsi_long_target: float,
     rsi_short_target: float,
-    trade_mode: str = "Continuation",
     atr_period: int = 14,
     atr_mult: float = 2.0,
 ) -> pd.DataFrame:
     """
-    Coherent backtest:
-      - Signals are taken from df_prepped where setup != "" (same as Live logic)
-      - Entry: next candle open
-      - Exits:
-          1) RSI target
-          2) Supertrend+ATR hybrid trailing stop
-          3) Time exit
+    Continuation-only backtest:
+      - Bullish Squeeze => LONG
+      - Bearish Squeeze => SHORT
+
+    Entry: next candle open after signal.
+    Exit (priority):
+      1) RSI target
+      2) Supertrend + ATR hybrid trailing stop
+      3) Time exit
     """
 
     df_prepped = prepare_trend_squeeze(
@@ -458,22 +447,18 @@ def backtest_trend_squeeze(
         max_exit_idx = min(entry_idx + hold_bars - 1, len(indexed_df) - 1)
         setup = signals.loc[ts, "setup"]
 
-        # Direction mapping must match Live exactly
-        if trade_mode == "Reversal":
-            is_long = (setup == "Bearish Squeeze")
-        else:
-            is_long = (setup == "Bullish Squeeze")
-
+        # ✅ Continuation only mapping
+        is_long = (setup == "Bullish Squeeze")
         direction = 1 if is_long else -1
 
         entry_time = indexed_df.index[entry_idx]
         entry_price = indexed_df["open"].iloc[entry_idx]
 
         entry_atr = indexed_df["atr"].iloc[entry_idx]
-        if np.isnan(entry_atr) or entry_atr <= 0:
+        if pd.isna(entry_atr) or entry_atr <= 0:
             continue
 
-        # initial hybrid stop using ATR
+        # Initial stop
         trail_stop = (
             entry_price - atr_mult * entry_atr
             if is_long
@@ -490,16 +475,16 @@ def backtest_trend_squeeze(
             st_line = row["supertrend"]
             atr_val = row["atr"]
 
-            # update hybrid stop
+            # Update hybrid trailing stop
             if pd.notna(st_line) and pd.notna(atr_val) and atr_val > 0:
                 if is_long:
                     proposed = min(st_line, c - atr_mult * atr_val)
-                    trail_stop = max(trail_stop, proposed)  # only tighter upward
+                    trail_stop = max(trail_stop, proposed)  # tighten upward only
                 else:
                     proposed = max(st_line, c + atr_mult * atr_val)
-                    trail_stop = min(trail_stop, proposed)  # only tighter downward
+                    trail_stop = min(trail_stop, proposed)  # tighten downward only
 
-            # exit priority
+            # Exit priority
             if is_long:
                 if rsi >= rsi_long_target:
                     exit_idx, exit_reason = j, "TARGET_RSI"
@@ -541,7 +526,7 @@ def backtest_trend_squeeze(
 #  UI Header
 # ======================
 
-st.title("📉 Trend Squeeze Screener & Backtester")
+st.title("📉 Trend Squeeze Screener & Backtester (Continuation Only)")
 
 n = now_ist()
 mode_str = "🟢 LIVE MARKET" if market_open_now() else "🔵 OFF-MARKET"
@@ -559,7 +544,7 @@ with st.sidebar:
         max_value=64,
         value=32,
         step=4,
-        help="Live will scan the last N 15m candles and log any setups it finds (deduped).",
+        help="Live scans last N 15m candles and logs any setups it finds (deduped).",
     )
     retention_hours = st.slider(
         "Keep signals for (hours)",
@@ -570,9 +555,7 @@ with st.sidebar:
         help="Display window for signals from Google Sheet.",
     )
 
-st.markdown(
-    "This app is now **coherent**: Live detects setups on candle timestamps (same as backtest) and stores them for viewing."
-)
+st.info("Continuation only: **Bullish Squeeze → LONG** | **Bearish Squeeze → SHORT**")
 
 # ======================
 # Zerodha auth
@@ -630,11 +613,11 @@ instrument_token_map = build_instrument_token_map(kite, stock_list)
 live_tab, backtest_tab = st.tabs(["📺 Live Screener", "📜 Backtest"])
 
 # ======================
-# LIVE TAB (catch-up scan + dedup + sheet health)
+# LIVE TAB (Continuation-only: catch-up scan + dedup + sheet health)
 # ======================
 
 with live_tab:
-    st.subheader("📺 Live Screener (Catch-up + 24h memory)")
+    st.subheader("📺 Live Screener (Continuation Only + Catch-up + 24h memory)")
 
     ws, ws_err = get_signals_worksheet()
     health_col1, health_col2 = st.columns([1, 4])
@@ -651,17 +634,14 @@ with live_tab:
         else:
             st.caption(f"Using Google Sheet: **{SIGNAL_SHEET_NAME}** (sheet1)")
 
-    # If sheet is unavailable, we still show current-detection; but coherence requires sheet.
     existing_keys = set()
     if ws and not ws_err:
         existing_keys = fetch_existing_keys_recent(ws, days_back=3)
 
-    # --- Scan & build signal rows (from candle timestamps) ---
     rows_to_append = []
-    signals_found = 0
-
     logged_at = fmt_dt(now_ist())
 
+    # Catch-up scan for each symbol
     for symbol in stock_list:
         token = instrument_token_map.get(symbol)
         if not token:
@@ -680,14 +660,12 @@ with live_tab:
                 bbw_pct_threshold=bbw_pct_threshold,
             )
 
-            # Scan last N candles to avoid missing setups when app wasn't open
             recent = df_prepped.tail(int(catchup_candles)).copy()
             recent = recent[recent["setup"] != ""]
             if recent.empty:
                 continue
 
             for candle_ts, r in recent.iterrows():
-                # Candle timestamp is the truth
                 signal_time = ts_to_sheet_str(candle_ts)
 
                 setup = r["setup"]
@@ -698,34 +676,24 @@ with live_tab:
                 rsi = float(r.get("rsi", np.nan))
                 adx = float(r.get("adx", np.nan))
 
-                # Continuation
-                cont_bias = "LONG" if setup == "Bullish Squeeze" else "SHORT"
-                cont_key = f"{symbol}|Continuation|{signal_time}|{setup}|{cont_bias}"
-                if cont_key not in existing_keys:
-                    rows_to_append.append([
-                        cont_key, signal_time, logged_at, symbol, "Continuation", setup, cont_bias,
-                        ltp, bbw, bbw_rank, rsi, adx, trend
-                    ])
-                    existing_keys.add(cont_key)
-                    signals_found += 1
+                # ✅ Continuation-only bias
+                bias = "LONG" if setup == "Bullish Squeeze" else "SHORT"
+                key = f"{symbol}|Continuation|{signal_time}|{setup}|{bias}"
 
-                # Reversal
-                rev_bias = "LONG" if setup == "Bearish Squeeze" else "SHORT"
-                rev_key = f"{symbol}|Reversal|{signal_time}|{setup}|{rev_bias}"
-                if rev_key not in existing_keys:
+                if key not in existing_keys:
                     rows_to_append.append([
-                        rev_key, signal_time, logged_at, symbol, "Reversal", setup, rev_bias,
+                        key, signal_time, logged_at,
+                        symbol, "Continuation", setup, bias,
                         ltp, bbw, bbw_rank, rsi, adx, trend
                     ])
-                    existing_keys.add(rev_key)
-                    signals_found += 1
+                    existing_keys.add(key)
 
         except Exception as e:
             if show_debug:
                 st.warning(f"{symbol}: error -> {e}")
             continue
 
-    # Append signals (if possible)
+    # Append signals
     appended = 0
     append_err = None
     if ws and not ws_err:
@@ -734,7 +702,7 @@ with live_tab:
     if ws_err:
         st.warning(
             "Google Sheet not available, so Live will only show what it detects right now. "
-            "Coherence requires sheet access."
+            "For 24h memory + coherence, Sheets must be ✅."
         )
     else:
         if append_err:
@@ -742,36 +710,22 @@ with live_tab:
         else:
             st.caption(f"Logged **{appended}** new signals this refresh (deduped).")
 
-    # Load and show last 24h window (the user's monitoring truth)
+    # Show last X hours
     if ws and not ws_err:
         df_recent = load_recent_signals(ws, hours=int(retention_hours))
     else:
         df_recent = pd.DataFrame()
 
-    st.markdown(f"### 🧠 Signals in the last {int(retention_hours)} hours (deduped by Symbol+Mode)")
+    st.markdown(f"### 🧠 Continuation signals in the last {int(retention_hours)} hours (latest per symbol)")
     if df_recent is None or df_recent.empty:
-        st.info("No signals in the selected window.")
+        st.info("No continuation signals in the selected window.")
     else:
-        # Split into continuation & reversal for clarity
-        df_cont = df_recent[df_recent["Mode"] == "Continuation"].copy()
-        df_rev = df_recent[df_recent["Mode"] == "Reversal"].copy()
-
-        st.markdown("#### 🔵 Continuation (with trend)")
-        if df_cont.empty:
-            st.info("No continuation signals in the selected window.")
-        else:
-            st.dataframe(df_cont, use_container_width=True)
-
-        st.markdown("#### 🟠 Reversal (against trend)")
-        if df_rev.empty:
-            st.info("No reversal signals in the selected window.")
-        else:
-            st.dataframe(df_rev, use_container_width=True)
+        st.dataframe(df_recent, use_container_width=True)
 
     st.markdown("---")
     st.caption(
-        "Why this fixes your mismatch: Live now scans the last N candles every refresh and logs signals by candle timestamp. "
-        "Backtest and Live are now referring to the same events."
+        "Coherence guarantee: Live logs **signal candle timestamps** (not refresh time) and scans the last N candles each refresh. "
+        "Backtest uses the same setup events."
     )
 
 # ======================
@@ -779,7 +733,7 @@ with live_tab:
 # ======================
 
 with backtest_tab:
-    st.subheader("📜 Trend Squeeze Backtest (15-minute)")
+    st.subheader("📜 Backtest (Continuation Only • 15-minute)")
 
     if not instrument_token_map:
         st.error("No instrument tokens resolved. Cannot run backtest.")
@@ -818,19 +772,12 @@ with backtest_tab:
         with col_rsi2:
             rsi_short_target = st.slider("RSI target for SHORT", 20, 45, 30, 1)
 
-        trade_mode_label = st.radio(
-            "How to trade the squeeze?",
-            options=["Continuation (with trend)", "Reversal (against trend)"],
-            index=0,
-        )
-        trade_mode = "Continuation" if "Continuation" in trade_mode_label else "Reversal"
-
         if st.button("Run Backtest"):
             token = instrument_token_map.get(bt_symbol)
             if not token:
                 st.error(f"No instrument token found for {bt_symbol}.")
             else:
-                st.info(f"Backtesting {bt_symbol} ({trade_mode}) with last {lookback_days} days 15m data...")
+                st.info(f"Backtesting {bt_symbol} (Continuation only) with last {lookback_days} days 15m data...")
 
                 df_bt = get_ohlc_15min(
                     kite,
@@ -853,7 +800,6 @@ with backtest_tab:
                         st_mult=st_mult,
                         rsi_long_target=rsi_long_target,
                         rsi_short_target=rsi_short_target,
-                        trade_mode=trade_mode,
                         atr_period=atr_period,
                         atr_mult=atr_mult,
                     )
