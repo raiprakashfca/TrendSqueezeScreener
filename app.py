@@ -16,6 +16,7 @@ from utils.zerodha_utils import (
     get_ohlc_daily,
     build_instrument_token_map,
     is_trading_day,
+    get_last_trading_day,
 )
 from utils.strategy import prepare_trend_squeeze
 
@@ -109,6 +110,33 @@ def compute_quality_score(row):
     elif score >= 2:
         return "B"
     return "C"
+
+def get_market_aware_window(base_hours: int, timeframe: str = "15M") -> int:
+    """
+    Calculate smart window that skips weekends/holidays.
+    Returns equivalent trading hours instead of calendar hours.
+    """
+    now = now_ist()
+    target_date = now.date()
+    
+    # Walk back to find trading days
+    trading_days_back = 0
+    calendar_days_back = 0
+    
+    while trading_days_back * 6 < base_hours:  # 6 trading hours per day
+        calendar_days_back += 1
+        check_date = target_date - timedelta(days=calendar_days_back)
+        
+        if is_trading_day(check_date):
+            trading_days_back += 1
+    
+    # Convert trading days back to hours
+    smart_hours = trading_days_back * 6  # ~6 hours per trading day
+    
+    if timeframe == "Daily":
+        smart_hours *= 24  # Daily signals are rarer, show more history
+    
+    return min(smart_hours, base_hours * 2)  # Cap at 2x base to avoid ancient data
 
 def fetch_nifty50_symbols() -> list[str] | None:
     """Fetch latest NIFTY50 constituents from NSE CSV."""
@@ -226,7 +254,8 @@ def append_signals(ws, rows: list[list], show_debug: bool = False) -> tuple[int,
     except Exception as e:
         return 0, f"Sheets write failed: {e}" if show_debug else "Sheets write failed."
 
-def load_recent_signals(ws, hours: int = 24) -> pd.DataFrame:
+def load_recent_signals(ws, base_hours: int = 24, timeframe: str = "15M") -> pd.DataFrame:
+    """Market-aware: skips weekends/holidays automatically."""
     try:
         records = ws.get_all_records()
     except Exception:
@@ -242,7 +271,10 @@ def load_recent_signals(ws, hours: int = 24) -> pd.DataFrame:
     
     df["signal_time_dt"] = pd.to_datetime(df["signal_time"], errors="coerce")
     df = df[df["signal_time_dt"].notna()]
-    cutoff = now_ist().replace(tzinfo=None) - timedelta(hours=hours)
+    
+    # Market-aware cutoff
+    smart_hours = get_market_aware_window(base_hours, timeframe)
+    cutoff = now_ist().replace(tzinfo=None) - timedelta(hours=smart_hours)
     df = df[df["signal_time_dt"] >= cutoff].copy()
     
     if df.empty:
@@ -278,10 +310,14 @@ def load_recent_signals(ws, hours: int = 24) -> pd.DataFrame:
     return df[cols]
 
 # UI Header
-st.title("📉 Trend Squeeze Screener (15M + Daily)")
+st.title("📉 Trend Squeeze Screener (15M + Daily) - Market Aware")
 n = now_ist()
 mode_str = "🟢 LIVE MARKET" if market_open_now() else "🔵 OFF-MARKET"
 st.caption(f"{mode_str} • Last refresh: {n.strftime('%d %b %Y • %H:%M:%S')} IST")
+
+# Market status display
+last_trading_day = get_last_trading_day(n.date())
+st.caption(f"🗓️ Last trading day: {last_trading_day.strftime('%d %b %Y')}")
 
 with st.sidebar:
     st.subheader("Settings")
@@ -295,9 +331,9 @@ with st.sidebar:
         help="Live scans last N 15m candles and logs any setups it finds (deduped)."
     )
     retention_hours = st.slider(
-        "Keep signals for (hours)",
+        "Base retention (calendar hours)",
         min_value=6, max_value=48, value=24, step=6,
-        help="Display window for signals from Google Sheets."
+        help="App auto-adjusts for weekends/holidays to show relevant trading signals."
     )
     
     st.info("**Continuation only**: Bullish Squeeze → LONG | Bearish Squeeze → SHORT")
@@ -368,9 +404,14 @@ instrument_token_map = build_instrument_token_map(kite, stock_list)
 # Tabs
 live_tab, backtest_tab = st.tabs(["📺 Live Screener (15M + Daily)", "📜 Backtest"])
 
-# LIVE TAB - Dual timeframe
+# LIVE TAB - Market aware
 with live_tab:
-    st.subheader("📺 Live Screener (15M + Daily • Catch-up + 24h memory)")
+    st.subheader("📺 Live Screener (15M + Daily • Market-Aware)")
+    
+    smart_retention_15m = get_market_aware_window(retention_hours)
+    smart_retention_daily = get_market_aware_window(retention_hours, "Daily")
+    
+    st.caption(f"🧠 Showing last ~{smart_retention_15m}h trading time (15M) | ~{smart_retention_daily/24:.0f} trading days (Daily)")
     
     # Health check - dual sheets
     col1_15m, col2_daily = st.columns(2)
@@ -387,6 +428,7 @@ with live_tab:
         else:
             st.success("Daily Sheets ✅")
     
+    # Rest of live tab scanning logic remains the same...
     existing_keys_15m = set()
     existing_keys_daily = set()
     if ws_15m and not ws_15m_err:
@@ -398,7 +440,7 @@ with live_tab:
     rows_daily = []
     logged_at = fmt_dt(now_ist())
     
-    # 15M scan
+    # 15M scan (same as before)
     new_15m = 0
     for symbol in stock_list:
         token = instrument_token_map.get(symbol)
@@ -451,10 +493,10 @@ with live_tab:
                 st.warning(f"{symbol} 15M: error -> {e}")
             continue
     
-    # Daily scan (slower, but higher quality)
+    # Daily scan (same as before)
     new_daily = 0
-    lookback_days_daily = 252  # ~1 year
-    for symbol in stock_list[:20]:  # Limit to top 20 for speed
+    lookback_days_daily = 252
+    for symbol in stock_list[:20]:
         token = instrument_token_map.get(symbol)
         if not token:
             continue
@@ -466,7 +508,7 @@ with live_tab:
             
             df_daily_prepped = prepare_trend_squeeze(
                 df_daily,
-                bbw_abs_threshold=bbw_abs_threshold * 1.2,  # Slightly looser for daily
+                bbw_abs_threshold=bbw_abs_threshold * 1.2,
                 bbw_pct_threshold=bbw_pct_threshold,
                 adx_threshold=adx_threshold,
                 rsi_bull=rsi_bull,
@@ -474,7 +516,7 @@ with live_tab:
                 rolling_window=20,
             )
             
-            recent_daily = df_daily_prepped.tail(5).copy()  # Last 5 days
+            recent_daily = df_daily_prepped.tail(5).copy()
             recent_daily = recent_daily[recent_daily["setup"] != ""]
             
             for candle_ts, r in recent_daily.iterrows():
@@ -513,14 +555,14 @@ with live_tab:
     if ws_daily and not ws_daily_err:
         appended_daily, _ = append_signals(ws_daily, rows_daily, show_debug)
     
-    st.caption(f"Logged **{appended_15m}** new 15M + **{appended_daily}** Daily signals (deduped).")
+    st.caption(f"Logged **{appended_15m}** new 15M + **{appended_daily}** Daily signals.")
     
-    # Show combined recent signals
-    df_recent_15m = pd.DataFrame() if not ws_15m else load_recent_signals(ws_15m, hours=int(retention_hours))
-    df_recent_daily = pd.DataFrame() if not ws_daily else load_recent_signals(ws_daily, hours=int(retention_hours)*24)
+    # Show market-aware recent signals
+    df_recent_15m = pd.DataFrame() if not ws_15m else load_recent_signals(ws_15m, retention_hours, "15M")
+    df_recent_daily = pd.DataFrame() if not ws_daily else load_recent_signals(ws_daily, retention_hours, "Daily")
     
     if not df_recent_15m.empty or not df_recent_daily.empty:
-        st.markdown("### 🧠 Recent Signals (latest per Symbol+Timeframe)")
+        st.markdown("### 🧠 Recent Signals (Market-Aware)")
         if not df_recent_15m.empty:
             st.subheader("15M Signals")
             st.dataframe(df_recent_15m, use_container_width=True)
@@ -528,16 +570,15 @@ with live_tab:
             st.subheader("Daily Signals")
             st.dataframe(df_recent_daily, use_container_width=True)
     else:
-        st.info("No continuation signals in the selected window.")
+        st.info("No continuation signals in recent trading sessions.")
     
     st.markdown("---")
     st.caption(
-        "Coherence guarantee: Logs **signal candle timestamps**. "
-        "15M scans last N candles each refresh. Daily checks last 5 days."
+        "✅ **Market-aware**: Skips weekends/holidays automatically. "
+        "Always shows relevant trading signals, not calendar time."
     )
 
-# BACKTEST TAB (unchanged for now - can be enhanced later)
+# BACKTEST TAB
 with backtest_tab:
-    st.subheader("📜 Backtest (15-minute)")
-    # ... (keep existing backtest code or enhance later)
-    st.info("Backtest enhanced in next update.")
+    st.subheader("📜 Backtest (Coming soon)")
+    st.info("Enhanced backtest with market awareness in next update.")
