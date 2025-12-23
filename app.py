@@ -19,6 +19,127 @@ from utils.zerodha_utils import (
     get_last_trading_day,
 )
 from utils.strategy import prepare_trend_squeeze
+
+# ✅ MUST BE FIRST Streamlit call
+st.set_page_config(page_title="📉 Trend Squeeze Screener", layout="wide")
+st_autorefresh(interval=300000, key="auto_refresh")  # 5 min refresh
+
+IST = ZoneInfo("Asia/Kolkata")
+MARKET_OPEN = time(9, 15)
+MARKET_CLOSE = time(15, 30)
+
+# Dual sheets for 15min and Daily signals
+SIGNAL_SHEET_15M = "TrendSqueezeSignals_15M"
+SIGNAL_SHEET_DAILY = "TrendSqueezeSignals_Daily"
+
+# Direct Sheet IDs (from your URLs)
+SHEET_ID_15M = "1RP2tbh6WnMgEDAv5FWXD6GhePXno9bZ81ILFyoX6Fb8"
+SHEET_ID_DAILY = "1u-W5vu3KM6XPRr78o8yyK8pPaAjRUIFEEYKHyYGUsM0"
+
+# Schema with quality score and params
+SIGNAL_COLUMNS = [
+    "key",  # unique dedup key
+    "signal_time",  # candle timestamp (IST naive string)
+    "logged_at",  # when app logged it (IST naive string)
+    "symbol",
+    "timeframe",  # "15M" or "Daily"
+    "mode",  # always "Continuation"
+    "setup",  # Bullish Squeeze / Bearish Squeeze
+    "bias",  # LONG / SHORT
+    "ltp",
+    "bbw",
+    "bbw_pct_rank",
+    "rsi",
+    "adx",
+    "trend",
+    "quality_score",  # A/B/C grade
+    "params_hash",  # BBW_abs|BBW_pct|ADX|RSI_bull|RSI_bear
+]
+
+def now_ist() -> datetime:
+    return datetime.now(IST)
+
+def market_open_now() -> bool:
+    n = now_ist()
+    return is_trading_day(n.date()) and MARKET_OPEN <= n.time() <= MARKET_CLOSE
+
+def fmt_dt(dt: datetime) -> str:
+    return dt.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+
+def fmt_ts(ts) -> str:
+    """Pretty display time for backtest output."""
+    if isinstance(ts, pd.Timestamp):
+        try:
+            if ts.tzinfo is not None:
+                ts = ts.tz_convert("Asia/Kolkata")
+        except Exception:
+            pass
+        return ts.strftime("%d-%b-%Y %H:%M")
+    return str(ts)
+
+def ts_to_sheet_str(ts) -> str:
+    """Store as YYYY-MM-DD HH:MM:SS (IST naive) in Google Sheet."""
+    if isinstance(ts, pd.Timestamp):
+        try:
+            if ts.tzinfo is not None:
+                ts = ts.tz_convert("Asia/Kolkata")
+                ts = ts.tz_localize(None)
+        except Exception:
+            pass
+    if getattr(ts, "tzinfo", None) is not None:
+        ts = ts.tz_localize(None)
+    if isinstance(ts, datetime):
+        return ts.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+    return str(ts)
+
+def params_to_hash(bbw_abs, bbw_pct, adx, rsi_bull, rsi_bear):
+    return f"{bbw_abs:.3f}|{bbw_pct:.2f}|{adx:.1f}|{rsi_bull:.1f}|{rsi_bear:.1f}"
+
+def compute_quality_score(row):
+    """A/B/C grade based on setup strength."""
+    score = 0
+    if row.get("adx", 0) > 30:
+        score += 2
+    elif row.get("adx", 0) > 25:
+        score += 1
+    if row.get("bbw_pct_rank", 1) < 0.2:
+        score += 2
+    elif row.get("bbw_pct_rank", 1) < 0.35:
+        score += 1
+    ema_spread = abs(row.get("ema50", 0) - row.get("ema200", 0)) / row.get("close", 1)
+    if ema_spread > 0.05:
+        score += 1
+    if score >= 4:
+        return "A"
+    elif score >= 2:
+        return "B"
+    return "C"
+
+def get_market_aware_window(base_hours: int, timeframe: str = "15M") -> int:
+    """
+    Calculate smart window that skips weekends/holidays.
+    Returns equivalent trading hours instead of calendar hours.
+    """
+    now = now_ist()
+    target_date = now.date()
+    
+    trading_days_back = 0
+    calendar_days_back = 0
+    
+    while trading_days_back * 6 < base_hours:  # 6 trading hours per day
+        calendar_days_back += 1
+        check_date = target_date - timedelta(days=calendar_days_back)
+        
+        if is_trading_day(check_date):
+            trading_days_back += 1
+    
+    smart_hours = trading_days_back * 6  # ~6 hours per trading day
+    
+    if timeframe == "Daily":
+        smart_hours *= 24  # Daily signals are rarer, show more history
+    
+    return min(smart_hours, base_hours * 2)  # Cap at 2x base to avoid ancient data
+
 # Google Sheets helpers (dual sheets)
 def get_gspread_client():
     try:
@@ -43,11 +164,18 @@ def get_signals_worksheet(sheet_name):
         return None, err
     
     try:
-        sh = client.open(sheet_name)
+        # Prefer opening by Sheet ID if configured
+        if sheet_name == SIGNAL_SHEET_15M and SHEET_ID_15M:
+            sh = client.open_by_key(SHEET_ID_15M)
+        elif sheet_name == SIGNAL_SHEET_DAILY and SHEET_ID_DAILY:
+            sh = client.open_by_key(SHEET_ID_DAILY)
+        else:
+            # Fallback: open by file name
+            sh = client.open(sheet_name)
     except SpreadsheetNotFound:
         return None, (
-            f"Sheet '{sheet_name}' not found. Create it in Google Drive and share "
-            f"with the service account as Editor."
+            f"Sheet '{sheet_name}' not found. "
+            f"Check file name or Sheet ID in app.py."
         )
     except Exception as e:
         return None, f"Failed to open sheet '{sheet_name}': {e}"
@@ -156,121 +284,6 @@ def load_recent_signals(ws, base_hours: int = 24, timeframe: str = "15M") -> pd.
     ]
     return df[cols]
 
-# ✅ MUST BE FIRST Streamlit call
-st.set_page_config(page_title="📉 Trend Squeeze Screener", layout="wide")
-st_autorefresh(interval=300000, key="auto_refresh")  # 5 min refresh
-
-IST = ZoneInfo("Asia/Kolkata")
-MARKET_OPEN = time(9, 15)
-MARKET_CLOSE = time(15, 30)
-
-# Dual sheets for 15min and Daily signals
-SIGNAL_SHEET_15M = "TrendSqueezeSignals_15M"
-SIGNAL_SHEET_DAILY = "TrendSqueezeSignals_Daily"
-
-# Schema with quality score and params
-SIGNAL_COLUMNS = [
-    "key",  # unique dedup key
-    "signal_time",  # candle timestamp (IST naive string)
-    "logged_at",  # when app logged it (IST naive string)
-    "symbol",
-    "timeframe",  # "15M" or "Daily"
-    "mode",  # always "Continuation"
-    "setup",  # Bullish Squeeze / Bearish Squeeze
-    "bias",  # LONG / SHORT
-    "ltp",
-    "bbw",
-    "bbw_pct_rank",
-    "rsi",
-    "adx",
-    "trend",
-    "quality_score",  # A/B/C grade
-    "params_hash",  # BBW_abs|BBW_pct|ADX|RSI_bull|RSI_bear
-]
-
-def now_ist() -> datetime:
-    return datetime.now(IST)
-
-def market_open_now() -> bool:
-    n = now_ist()
-    return is_trading_day(n.date()) and MARKET_OPEN <= n.time() <= MARKET_CLOSE
-
-def fmt_dt(dt: datetime) -> str:
-    return dt.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
-
-def fmt_ts(ts) -> str:
-    """Pretty display time for backtest output."""
-    if isinstance(ts, pd.Timestamp):
-        try:
-            if ts.tzinfo is not None:
-                ts = ts.tz_convert("Asia/Kolkata")
-        except Exception:
-            pass
-        return ts.strftime("%d-%b-%Y %H:%M")
-    return str(ts)
-
-def ts_to_sheet_str(ts) -> str:
-    """Store as YYYY-MM-DD HH:MM:SS (IST naive) in Google Sheet."""
-    if isinstance(ts, pd.Timestamp):
-        try:
-            if ts.tzinfo is not None:
-                ts = ts.tz_convert("Asia/Kolkata")
-                ts = ts.tz_localize(None)
-        except Exception:
-            pass
-    if getattr(ts, "tzinfo", None) is not None:
-        ts = ts.tz_localize(None)
-    if isinstance(ts, datetime):
-        return ts.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
-    return str(ts)
-
-def params_to_hash(bbw_abs, bbw_pct, adx, rsi_bull, rsi_bear):
-    return f"{bbw_abs:.3f}|{bbw_pct:.2f}|{adx:.1f}|{rsi_bull:.1f}|{rsi_bear:.1f}"
-
-def compute_quality_score(row):
-    """A/B/C grade based on setup strength."""
-    score = 0
-    if row.get("adx", 0) > 30:
-        score += 2
-    elif row.get("adx", 0) > 25:
-        score += 1
-    if row.get("bbw_pct_rank", 1) < 0.2:
-        score += 2
-    elif row.get("bbw_pct_rank", 1) < 0.35:
-        score += 1
-    ema_spread = abs(row.get("ema50", 0) - row.get("ema200", 0)) / row.get("close", 1)
-    if ema_spread > 0.05:
-        score += 1
-    if score >= 4:
-        return "A"
-    elif score >= 2:
-        return "B"
-    return "C"
-
-def get_market_aware_window(base_hours: int, timeframe: str = "15M") -> int:
-    """
-    Calculate smart window that skips weekends/holidays.
-    Returns equivalent trading hours instead of calendar hours.
-    """
-    now = now_ist()
-    target_date = now.date()
-    
-    trading_days_back = 0
-    calendar_days_back = 0
-    
-    while trading_days_back * 6 < base_hours:  # 6 trading hours per day
-        calendar_days_back += 1
-        check_date = target_date - timedelta(days=calendar_days_back)
-        
-        if is_trading_day(check_date):
-            trading_days_back += 1
-    
-    smart_hours = trading_days_back * 6  # ~6 hours per trading day
-    
-    if timeframe == "Daily":
-        smart_hours *= 24  # Daily signals are rarer, show more history
-    
-    return min(smart_hours, base_hours * 2)  # Cap at 2x base to avoid ancient data
 # ---------- FYERS SESSION INIT ----------
 
 try:
@@ -281,7 +294,6 @@ try:
 except Exception as e:
     fyers_ok = False
     st.error(f"Fyers init failed: {e}")
-
 # UI Header
 st.title("📉 Trend Squeeze Screener (15M + Daily) - Market Aware")
 n = now_ist()
@@ -369,6 +381,7 @@ st.caption(f"Universe: NIFTY50 ({len(stock_list)} symbols).")
 
 # Tabs
 live_tab, backtest_tab = st.tabs(["📺 Live Screener (15M + Daily)", "📜 Backtest"])
+
 # LIVE TAB - Market aware
 with live_tab:
     st.subheader("📺 Live Screener (15M + Daily • Market-Aware)")
@@ -661,5 +674,3 @@ with backtest_tab:
 
 st.markdown("---")
 st.caption("✅ Fyers-powered: real-time data + dual timeframe + market-aware signals + full backtest.")
-
-
