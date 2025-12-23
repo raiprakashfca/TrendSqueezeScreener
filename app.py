@@ -19,6 +19,142 @@ from utils.zerodha_utils import (
     get_last_trading_day,
 )
 from utils.strategy import prepare_trend_squeeze
+# Google Sheets helpers (dual sheets)
+def get_gspread_client():
+    try:
+        sa = st.secrets["gcp_service_account"]
+    except Exception:
+        return None, "Missing st.secrets['gcp_service_account']"
+    
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    try:
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(sa, scope)
+        client = gspread.authorize(creds)
+        return client, None
+    except Exception as e:
+        return None, f"gspread auth failed: {e}"
+
+def get_signals_worksheet(sheet_name):
+    client, err = get_gspread_client()
+    if err:
+        return None, err
+    
+    try:
+        sh = client.open(sheet_name)
+    except SpreadsheetNotFound:
+        return None, (
+            f"Sheet '{sheet_name}' not found. Create it in Google Drive and share "
+            f"with the service account as Editor."
+        )
+    except Exception as e:
+        return None, f"Failed to open sheet '{sheet_name}': {e}"
+    
+    try:
+        ws = sh.sheet1
+    except Exception as e:
+        return None, f"Failed to access sheet1: {e}"
+    
+    # Ensure headers exist
+    try:
+        header = ws.row_values(1)
+        if not header:
+            ws.append_row(SIGNAL_COLUMNS)
+        else:
+            if header[:len(SIGNAL_COLUMNS)] != SIGNAL_COLUMNS:
+                if len(header) < len(SIGNAL_COLUMNS):
+                    ws.update("A1", [SIGNAL_COLUMNS])
+    except Exception as e:
+        return None, f"Failed to ensure headers: {e}"
+    
+    return ws, None
+
+def fetch_existing_keys_recent(ws, days_back: int = 3) -> set:
+    try:
+        records = ws.get_all_records()
+    except Exception:
+        return set()
+    
+    if not records:
+        return set()
+    
+    df = pd.DataFrame(records)
+    if "key" not in df.columns or "signal_time" not in df.columns:
+        return set(df.get("key", pd.Series(dtype=str)).astype(str).tolist())
+    
+    df["signal_time_dt"] = pd.to_datetime(df["signal_time"], errors="coerce")
+    cutoff = now_ist().replace(tzinfo=None) - timedelta(days=days_back)
+    df = df[df["signal_time_dt"].notna()]
+    df = df[df["signal_time_dt"] >= cutoff]
+    return set(df["key"].astype(str).tolist())
+
+def append_signals(ws, rows: list[list], show_debug: bool = False) -> tuple[int, str | None]:
+    if not rows:
+        return 0, None
+    try:
+        ws.append_rows(rows, value_input_option="USER_ENTERED")
+        return len(rows), None
+    except APIError as e:
+        return 0, f"Sheets APIError: {e}" if show_debug else "Sheets write failed (APIError)."
+    except Exception as e:
+        return 0, f"Sheets write failed: {e}" if show_debug else "Sheets write failed."
+
+def load_recent_signals(ws, base_hours: int = 24, timeframe: str = "15M") -> pd.DataFrame:
+    """Market-aware: skips weekends/holidays automatically."""
+    try:
+        records = ws.get_all_records()
+    except Exception:
+        return pd.DataFrame()
+    
+    if not records:
+        return pd.DataFrame()
+    
+    df = pd.DataFrame(records)
+    for c in SIGNAL_COLUMNS:
+        if c not in df.columns:
+            df[c] = None
+    
+    df["signal_time_dt"] = pd.to_datetime(df["signal_time"], errors="coerce")
+    df = df[df["signal_time_dt"].notna()]
+    
+    # Market-aware cutoff
+    smart_hours = get_market_aware_window(base_hours, timeframe)
+    cutoff = now_ist().replace(tzinfo=None) - timedelta(hours=smart_hours)
+    df = df[df["signal_time_dt"] >= cutoff].copy()
+    
+    if df.empty:
+        return df
+    
+    df["Timestamp"] = df["signal_time_dt"].dt.strftime("%d-%b-%Y %H:%M")
+    df.rename(
+        columns={
+            "symbol": "Symbol",
+            "timeframe": "Timeframe",
+            "mode": "Mode",
+            "setup": "Setup",
+            "bias": "Bias",
+            "ltp": "LTP",
+            "bbw": "BBW",
+            "bbw_pct_rank": "BBW %Rank",
+            "rsi": "RSI",
+            "adx": "ADX",
+            "trend": "Trend",
+            "quality_score": "Quality",
+        },
+        inplace=True,
+    )
+    
+    # Dedup display: keep latest per Symbol+Timeframe
+    df = df.sort_values("signal_time_dt", ascending=False)
+    df = df.drop_duplicates(subset=["Symbol", "Timeframe"], keep="first")
+    
+    cols = [
+        "Timestamp", "Symbol", "Timeframe", "Quality", "Bias", "Setup",
+        "LTP", "BBW", "BBW %Rank", "RSI", "ADX", "Trend"
+    ]
+    return df[cols]
 
 # ✅ MUST BE FIRST Streamlit call
 st.set_page_config(page_title="📉 Trend Squeeze Screener", layout="wide")
@@ -525,4 +661,5 @@ with backtest_tab:
 
 st.markdown("---")
 st.caption("✅ Fyers-powered: real-time data + dual timeframe + market-aware signals + full backtest.")
+
 
