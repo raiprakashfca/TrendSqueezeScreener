@@ -1,17 +1,17 @@
 import io
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
+import json
+
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
-import json
 from streamlit_autorefresh import st_autorefresh
 import gspread
 from gspread.exceptions import SpreadsheetNotFound, APIError
 from oauth2client.service_account import ServiceAccountCredentials
 
-from utils.token_utils import load_credentials_from_gsheet
 from utils.zerodha_utils import (
     init_fyers_session,
     get_ohlc_15min,
@@ -20,7 +20,6 @@ from utils.zerodha_utils import (
     get_last_trading_day,
 )
 from utils.strategy import prepare_trend_squeeze
-st.write("Secrets keys:", list(st.secrets.keys()))
 
 # ✅ MUST BE FIRST Streamlit call
 st.set_page_config(page_title="📉 Trend Squeeze Screener", layout="wide")
@@ -40,22 +39,22 @@ SHEET_ID_DAILY = "1u-W5vu3KM6XPRr78o8yyK8pPaAjRUIFEEYKHyYGUsM0"
 
 # Schema with quality score and params
 SIGNAL_COLUMNS = [
-    "key",  # unique dedup key
-    "signal_time",  # candle timestamp (IST naive string)
-    "logged_at",  # when app logged it (IST naive string)
+    "key",
+    "signal_time",
+    "logged_at",
     "symbol",
-    "timeframe",  # "15M" or "Daily"
-    "mode",  # always "Continuation"
-    "setup",  # Bullish Squeeze / Bearish Squeeze
-    "bias",  # LONG / SHORT
+    "timeframe",
+    "mode",
+    "setup",
+    "bias",
     "ltp",
     "bbw",
     "bbw_pct_rank",
     "rsi",
     "adx",
     "trend",
-    "quality_score",  # A/B/C grade
-    "params_hash",  # BBW_abs|BBW_pct|ADX|RSI_bull|RSI_bear
+    "quality_score",
+    "params_hash",
 ]
 
 def now_ist() -> datetime:
@@ -69,7 +68,6 @@ def fmt_dt(dt: datetime) -> str:
     return dt.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
 
 def fmt_ts(ts) -> str:
-    """Pretty display time for backtest output."""
     if isinstance(ts, pd.Timestamp):
         try:
             if ts.tzinfo is not None:
@@ -80,7 +78,6 @@ def fmt_ts(ts) -> str:
     return str(ts)
 
 def ts_to_sheet_str(ts) -> str:
-    """Store as YYYY-MM-DD HH:MM:SS (IST naive) in Google Sheet."""
     if isinstance(ts, pd.Timestamp):
         try:
             if ts.tzinfo is not None:
@@ -98,7 +95,6 @@ def params_to_hash(bbw_abs, bbw_pct, adx, rsi_bull, rsi_bear):
     return f"{bbw_abs:.3f}|{bbw_pct:.2f}|{adx:.1f}|{rsi_bull:.1f}|{rsi_bear:.1f}"
 
 def compute_quality_score(row):
-    """A/B/C grade based on setup strength."""
     score = 0
     if row.get("adx", 0) > 30:
         score += 2
@@ -118,37 +114,30 @@ def compute_quality_score(row):
     return "C"
 
 def get_market_aware_window(base_hours: int, timeframe: str = "15M") -> int:
-    """
-    Calculate smart window that skips weekends/holidays.
-    Returns equivalent trading hours instead of calendar hours.
-    """
     now = now_ist()
     target_date = now.date()
-    
     trading_days_back = 0
     calendar_days_back = 0
-    
-    while trading_days_back * 6 < base_hours:  # 6 trading hours per day
+    while trading_days_back * 6 < base_hours:
         calendar_days_back += 1
         check_date = target_date - timedelta(days=calendar_days_back)
-        
         if is_trading_day(check_date):
             trading_days_back += 1
-    
-    smart_hours = trading_days_back * 6  # ~6 hours per trading day
-    
+    smart_hours = trading_days_back * 6
     if timeframe == "Daily":
-        smart_hours *= 24  # Daily signals are rarer, show more history
-    
-    return min(smart_hours, base_hours * 2)  # Cap at 2x base to avoid ancient data
+        smart_hours *= 24
+    return min(smart_hours, base_hours * 2)
 
-# Google Sheets helpers (dual sheets)
+# Google Sheets helpers (gcp_service_account is JSON string in secrets)
 def get_gspread_client():
     try:
-        sa = st.secrets["gcp_service_account"]
+        raw = st.secrets["gcp_service_account"]
     except Exception:
         return None, "Missing st.secrets['gcp_service_account']"
-    
+    try:
+        sa = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    except Exception as e:
+        return None, f"Invalid gcp_service_account format: {e}"
     scope = [
         "https://spreadsheets.google.com/feeds",
         "https://www.googleapis.com/auth/drive",
@@ -164,30 +153,23 @@ def get_signals_worksheet(sheet_name):
     client, err = get_gspread_client()
     if err:
         return None, err
-    
     try:
-        # Prefer opening by Sheet ID if configured
         if sheet_name == SIGNAL_SHEET_15M and SHEET_ID_15M:
             sh = client.open_by_key(SHEET_ID_15M)
         elif sheet_name == SIGNAL_SHEET_DAILY and SHEET_ID_DAILY:
             sh = client.open_by_key(SHEET_ID_DAILY)
         else:
-            # Fallback: open by file name
             sh = client.open(sheet_name)
     except SpreadsheetNotFound:
         return None, (
-            f"Sheet '{sheet_name}' not found. "
-            f"Check file name or Sheet ID in app.py."
+            f"Sheet '{sheet_name}' not found. Check file name or Sheet ID in app.py."
         )
     except Exception as e:
         return None, f"Failed to open sheet '{sheet_name}': {e}"
-    
     try:
         ws = sh.sheet1
     except Exception as e:
         return None, f"Failed to access sheet1: {e}"
-    
-    # Ensure headers exist
     try:
         header = ws.row_values(1)
         if not header:
@@ -198,7 +180,6 @@ def get_signals_worksheet(sheet_name):
                     ws.update("A1", [SIGNAL_COLUMNS])
     except Exception as e:
         return None, f"Failed to ensure headers: {e}"
-    
     return ws, None
 
 def fetch_existing_keys_recent(ws, days_back: int = 3) -> set:
@@ -206,14 +187,11 @@ def fetch_existing_keys_recent(ws, days_back: int = 3) -> set:
         records = ws.get_all_records()
     except Exception:
         return set()
-    
     if not records:
         return set()
-    
     df = pd.DataFrame(records)
     if "key" not in df.columns or "signal_time" not in df.columns:
         return set(df.get("key", pd.Series(dtype=str)).astype(str).tolist())
-    
     df["signal_time_dt"] = pd.to_datetime(df["signal_time"], errors="coerce")
     cutoff = now_ist().replace(tzinfo=None) - timedelta(days=days_back)
     df = df[df["signal_time_dt"].notna()]
@@ -232,31 +210,23 @@ def append_signals(ws, rows: list[list], show_debug: bool = False) -> tuple[int,
         return 0, f"Sheets write failed: {e}" if show_debug else "Sheets write failed."
 
 def load_recent_signals(ws, base_hours: int = 24, timeframe: str = "15M") -> pd.DataFrame:
-    """Market-aware: skips weekends/holidays automatically."""
     try:
         records = ws.get_all_records()
     except Exception:
         return pd.DataFrame()
-    
     if not records:
         return pd.DataFrame()
-    
     df = pd.DataFrame(records)
     for c in SIGNAL_COLUMNS:
         if c not in df.columns:
             df[c] = None
-    
     df["signal_time_dt"] = pd.to_datetime(df["signal_time"], errors="coerce")
     df = df[df["signal_time_dt"].notna()]
-    
-    # Market-aware cutoff
     smart_hours = get_market_aware_window(base_hours, timeframe)
     cutoff = now_ist().replace(tzinfo=None) - timedelta(hours=smart_hours)
     df = df[df["signal_time_dt"] >= cutoff].copy()
-    
     if df.empty:
         return df
-    
     df["Timestamp"] = df["signal_time_dt"].dt.strftime("%d-%b-%Y %H:%M")
     df.rename(
         columns={
@@ -275,11 +245,8 @@ def load_recent_signals(ws, base_hours: int = 24, timeframe: str = "15M") -> pd.
         },
         inplace=True,
     )
-    
-    # Dedup display: keep latest per Symbol+Timeframe
     df = df.sort_values("signal_time_dt", ascending=False)
     df = df.drop_duplicates(subset=["Symbol", "Timeframe"], keep="first")
-    
     cols = [
         "Timestamp", "Symbol", "Timeframe", "Quality", "Bias", "Setup",
         "LTP", "BBW", "BBW %Rank", "RSI", "ADX", "Trend"
@@ -287,7 +254,6 @@ def load_recent_signals(ws, base_hours: int = 24, timeframe: str = "15M") -> pd.
     return df[cols]
 
 # ---------- FYERS SESSION INIT ----------
-
 try:
     fy_app_id = st.secrets["fyers_app_id"]
     fy_access = st.secrets["fyers_access_token"]
@@ -325,21 +291,19 @@ with st.sidebar:
     
     st.info("**Continuation only**: Bullish Squeeze → LONG | Bearish Squeeze → SHORT")
     
-    # Parameter profiles
     param_profile = st.selectbox(
         "Parameter Profile",
         ["Normal", "Conservative", "Aggressive"],
         help="Conservative: tighter filters | Aggressive: more signals"
     )
 
-# Dynamic params based on profile
 if param_profile == "Conservative":
     bbw_abs_default, bbw_pct_default = 0.035, 0.25
     adx_default, rsi_bull_default, rsi_bear_default = 25.0, 60.0, 40.0
 elif param_profile == "Aggressive":
     bbw_abs_default, bbw_pct_default = 0.065, 0.45
     adx_default, rsi_bull_default, rsi_bear_default = 18.0, 52.0, 48.0
-else:  # Normal
+else:
     bbw_abs_default, bbw_pct_default = 0.05, 0.35
     adx_default, rsi_bull_default, rsi_bear_default = 20.0, 55.0, 45.0
 
@@ -367,7 +331,6 @@ with c5:
 
 params_hash = params_to_hash(bbw_abs_threshold, bbw_pct_threshold, adx_threshold, rsi_bull, rsi_bear)
 
-# Universe (keep your existing list)
 fallback_nifty50 = [
     "ADANIENT","ADANIPORTS","APOLLOHOSP","ASIANPAINT","AXISBANK","BAJAJ-AUTO","BAJFINANCE",
     "BAJAJFINSV","BHARTIARTL","BPCL","BRITANNIA","CIPLA","COALINDIA","DIVISLAB","DRREDDY",
@@ -377,14 +340,11 @@ fallback_nifty50 = [
     "TECHM","TITAN","ULTRACEMCO","UPL","WIPRO","HEROMOTOCO","SHREECEM"
 ]
 
-# For Fyers we still use plain symbols; to_fyers_symbol() converts internally
 stock_list = fallback_nifty50
 st.caption(f"Universe: NIFTY50 ({len(stock_list)} symbols).")
 
-# Tabs
 live_tab, backtest_tab = st.tabs(["📺 Live Screener (15M + Daily)", "📜 Backtest"])
 
-# LIVE TAB - Market aware
 with live_tab:
     st.subheader("📺 Live Screener (15M + Daily • Market-Aware)")
     
@@ -396,7 +356,6 @@ with live_tab:
         f"~{smart_retention_daily/24:.0f} trading days (Daily)"
     )
     
-    # Health check - dual sheets
     col1_15m, col2_daily = st.columns(2)
     with col1_15m:
         ws_15m, ws_15m_err = get_signals_worksheet(SIGNAL_SHEET_15M)
@@ -422,14 +381,12 @@ with live_tab:
     rows_daily = []
     logged_at = fmt_dt(now_ist())
     
-    # 15M scan (Fyers data)
     new_15m = 0
     for symbol in stock_list:
         try:
             df = get_ohlc_15min(symbol, days_back=7)
             if df is None or df.shape[0] < 60:
                 continue
-            
             df_prepped = prepare_trend_squeeze(
                 df,
                 bbw_abs_threshold=bbw_abs_threshold,
@@ -439,10 +396,8 @@ with live_tab:
                 rsi_bear=rsi_bear,
                 rolling_window=20,
             )
-            
             recent = df_prepped.tail(int(catchup_candles_15m)).copy()
             recent = recent[recent["setup"] != ""]
-            
             for candle_ts, r in recent.iterrows():
                 signal_time = ts_to_sheet_str(candle_ts)
                 setup = r["setup"]
@@ -452,26 +407,22 @@ with live_tab:
                 bbw_rank = r.get("bbw_pct_rank", np.nan)
                 rsi_val = float(r.get("rsi", np.nan))
                 adx_val = float(r.get("adx", np.nan))
-                
                 bias = "LONG" if setup == "Bullish Squeeze" else "SHORT"
                 key = f"{symbol}|15M|Continuation|{signal_time}|{setup}|{bias}"
-                
                 if key not in existing_keys_15m:
                     quality = compute_quality_score(r)
                     rows_15m.append([
-                        key, signal_time, logged_at, symbol, "15M", "Continuation", 
-                        setup, bias, ltp, bbw, bbw_rank, rsi_val, adx_val, trend, 
+                        key, signal_time, logged_at, symbol, "15M", "Continuation",
+                        setup, bias, ltp, bbw, bbw_rank, rsi_val, adx_val, trend,
                         quality, params_hash
                     ])
                     existing_keys_15m.add(key)
                     new_15m += 1
-                    
         except Exception as e:
             if show_debug:
                 st.warning(f"{symbol} 15M: error -> {e}")
             continue
     
-    # Daily scan (Fyers data)
     new_daily = 0
     lookback_days_daily = 252
     for symbol in stock_list[:20]:
@@ -479,7 +430,6 @@ with live_tab:
             df_daily = get_ohlc_daily(symbol, lookback_days=lookback_days_daily)
             if df_daily is None or df_daily.shape[0] < 100:
                 continue
-            
             df_daily_prepped = prepare_trend_squeeze(
                 df_daily,
                 bbw_abs_threshold=bbw_abs_threshold * 1.2,
@@ -489,10 +439,8 @@ with live_tab:
                 rsi_bear=rsi_bear,
                 rolling_window=20,
             )
-            
             recent_daily = df_daily_prepped.tail(5).copy()
             recent_daily = recent_daily[recent_daily["setup"] != ""]
-            
             for candle_ts, r in recent_daily.iterrows():
                 signal_time = ts_to_sheet_str(candle_ts)
                 setup = r["setup"]
@@ -502,26 +450,22 @@ with live_tab:
                 bbw_rank = r.get("bbw_pct_rank", np.nan)
                 rsi_val = float(r.get("rsi", np.nan))
                 adx_val = float(r.get("adx", np.nan))
-                
                 bias = "LONG" if setup == "Bullish Squeeze" else "SHORT"
                 key = f"{symbol}|Daily|Continuation|{signal_time}|{setup}|{bias}"
-                
                 if key not in existing_keys_daily:
                     quality = compute_quality_score(r)
                     rows_daily.append([
-                        key, signal_time, logged_at, symbol, "Daily", "Continuation", 
-                        setup, bias, ltp, bbw, bbw_rank, rsi_val, adx_val, trend, 
+                        key, signal_time, logged_at, symbol, "Daily", "Continuation",
+                        setup, bias, ltp, bbw, bbw_rank, rsi_val, adx_val, trend,
                         quality, params_hash
                     ])
                     existing_keys_daily.add(key)
                     new_daily += 1
-                    
         except Exception as e:
             if show_debug:
                 st.warning(f"{symbol} Daily: error -> {e}")
             continue
     
-    # Write signals
     appended_15m = 0
     appended_daily = 0
     if ws_15m and not ws_15m_err:
@@ -531,7 +475,6 @@ with live_tab:
     
     st.caption(f"Logged **{appended_15m}** new 15M + **{appended_daily}** Daily signals.")
     
-    # Show market-aware recent signals
     df_recent_15m = pd.DataFrame() if not ws_15m else load_recent_signals(ws_15m, retention_hours, "15M")
     df_recent_daily = pd.DataFrame() if not ws_daily else load_recent_signals(ws_daily, retention_hours, "Daily")
     
@@ -553,7 +496,6 @@ with live_tab:
     )
 # BACKTEST TAB - FULLY ENABLED
 def run_backtest_15m(symbols, days_back=30, params=None):
-    """Backtest using the same Fyers OHLC + squeeze logic as live tab."""
     if params is None:
         params = {
             "bbw_abs_threshold": 0.05,
@@ -565,12 +507,11 @@ def run_backtest_15m(symbols, days_back=30, params=None):
     trades = []
     total_bars = 0
 
-    for symbol in symbols[:10]:  # limit for speed
+    for symbol in symbols[:10]:
         try:
             df = get_ohlc_15min(symbol, days_back=days_back)
             if df is None or len(df) < 100:
                 continue
-
             df_prepped = prepare_trend_squeeze(
                 df,
                 bbw_abs_threshold=params["bbw_abs_threshold"],
@@ -580,10 +521,8 @@ def run_backtest_15m(symbols, days_back=30, params=None):
                 rsi_bear=params["rsi_bear"],
                 rolling_window=20,
             )
-
             signals = df_prepped[df_prepped["setup"] != ""]
             total_bars += len(df_prepped)
-
             for ts, row in signals.iterrows():
                 bias = "LONG" if row["setup"] == "Bullish Squeeze" else "SHORT"
                 entry = float(row["close"])
@@ -654,7 +593,6 @@ with backtest_tab:
                 st.success(
                     f"✅ Backtest complete: {len(bt_results)} signals across {total_bars:,} bars"
                 )
-
                 q_counts = bt_results["Quality"].value_counts()
                 col1, col2, col3 = st.columns(3)
                 with col1:
@@ -663,9 +601,7 @@ with backtest_tab:
                     st.metric("B Signals", int(q_counts.get("B", 0)))
                 with col3:
                     st.metric("C Signals", int(q_counts.get("C", 0)))
-
                 st.dataframe(bt_results, use_container_width=True)
-
                 bias_pct = bt_results["Bias"].value_counts(normalize=True) * 100
                 st.subheader("Bias Distribution (%)")
                 st.bar_chart(bias_pct)
@@ -676,5 +612,3 @@ with backtest_tab:
 
 st.markdown("---")
 st.caption("✅ Fyers-powered: real-time data + dual timeframe + market-aware signals + full backtest.")
-
-
