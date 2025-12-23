@@ -19,6 +19,7 @@ from utils.zerodha_utils import (
     get_last_trading_day,
 )
 from utils.strategy import prepare_trend_squeeze
+st.write("Secrets keys:", list(st.secrets.keys()))
 
 # ✅ MUST BE FIRST Streamlit call
 st.set_page_config(page_title="📉 Trend Squeeze Screener", layout="wide")
@@ -674,3 +675,4 @@ with backtest_tab:
 
 st.markdown("---")
 st.caption("✅ Fyers-powered: real-time data + dual timeframe + market-aware signals + full backtest.")
+
