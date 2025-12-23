@@ -5,6 +5,7 @@ import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+import json
 from streamlit_autorefresh import st_autorefresh
 import gspread
 from gspread.exceptions import SpreadsheetNotFound, APIError
@@ -675,4 +676,5 @@ with backtest_tab:
 
 st.markdown("---")
 st.caption("✅ Fyers-powered: real-time data + dual timeframe + market-aware signals + full backtest.")
+
 
