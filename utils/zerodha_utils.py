@@ -1,183 +1,174 @@
+# utils/zerodha_utils.py
+"""
+Replaced Zerodha-specific OHLC helpers with Fyers-powered functions.
+All other code can keep importing:
+    get_ohlc_15min(...)
+    get_ohlc_daily(...)
+so app.py does not need big changes.
+"""
+
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
+
 import pandas as pd
-from datetime import datetime, time, timedelta
-import streamlit as st
-from zoneinfo import ZoneInfo
+from fyers_apiv3 import fyersModel
 
-IST = ZoneInfo("Asia/Kolkata")
+# ---------- FYERS SESSION ----------
 
-# NSE holidays
-indian_market_holidays = [
-    "2025-01-26", "2025-03-29", "2025-04-10", "2025-04-14", "2025-05-01",
-    "2025-08-15", "2025-10-02", "2025-11-03", "2025-12-25",
-]
+FYERS_APP_ID = None      # set via init_fyers_session()
+FYERS_ACCESS_TOKEN = None
+_fyers_client: Optional[fyersModel.FyersModel] = None
 
-MARKET_OPEN = time(9, 15)
-MARKET_CLOSE = time(15, 30)
+
+def init_fyers_session(app_id: str, access_token: str):
+    """
+    Call this once from app.py after reading st.secrets.
+    Example in app.py:
+        from utils.zerodha_utils import init_fyers_session
+        init_fyers_session(st.secrets["fyers_app_id"], st.secrets["fyers_access_token"])
+    """
+    global FYERS_APP_ID, FYERS_ACCESS_TOKEN, _fyers_client
+    FYERS_APP_ID = app_id
+    FYERS_ACCESS_TOKEN = access_token
+
+    _fyers_client = fyersModel.FyersModel(
+        client_id=FYERS_APP_ID,
+        token=FYERS_ACCESS_TOKEN,
+        log_path=""
+    )
+
+
+def _ensure_client() -> fyersModel.FyersModel:
+    if _fyers_client is None:
+        raise RuntimeError("Fyers client not initialized. Call init_fyers_session() first.")
+    return _fyers_client
+
+# ---------- SYMBOL HELPERS ----------
+
+def to_fyers_symbol(symbol: str) -> str:
+    """
+    Convert simple symbol like 'RELIANCE' or 'TCS' to Fyers form 'NSE:RELIANCE-EQ'.
+    If already looks like 'NSE:XYZ-EQ', return as-is.
+    """
+    if symbol.upper().startswith("NSE:"):
+        return symbol.upper()
+    return f"NSE:{symbol.upper()}-EQ"
+
+# ---------- HISTORICAL OHLC HELPERS ----------
+
+def get_ohlc_15min(symbol: str, days_back: int = 30) -> pd.DataFrame:
+    """
+    15‑minute candles from Fyers, returned in the same OHLC format
+    your strategy / prepare_trend_squeeze already expects.
+    """
+    fyers = _ensure_client()
+
+    to_date = datetime.now()
+    from_date = to_date - timedelta(days=days_back)
+
+    data = {
+        "symbol": to_fyers_symbol(symbol),
+        "resolution": "15",          # 15‑minute candles
+        "date_format": "1",          # yyyy-mm-dd
+        "range_from": from_date.strftime("%Y-%m-%d"),
+        "range_to": to_date.strftime("%Y-%m-%d"),
+        "cont_flag": "1",
+    }
+
+    resp = fyers.history(data=data)
+    if resp.get("s") != "ok" or not resp.get("candles"):
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+    df = pd.DataFrame(
+        resp["candles"],
+        columns=["timestamp", "open", "high", "low", "close", "volume"]
+    )
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
+    df = df.astype({"open": float, "high": float, "low": float,
+                    "close": float, "volume": float})
+    df = df.set_index("timestamp").sort_index()
+    return df
+
+
+def get_ohlc_daily(symbol: str, lookback_days: int = 252) -> pd.DataFrame:
+    """
+    Daily candles from Fyers, same format as old Zerodha version.
+    """
+    fyers = _ensure_client()
+
+    to_date = datetime.now()
+    from_date = to_date - timedelta(days=lookback_days)
+
+    data = {
+        "symbol": to_fyers_symbol(symbol),
+        "resolution": "D",
+        "date_format": "1",
+        "range_from": from_date.strftime("%Y-%m-%d"),
+        "range_to": to_date.strftime("%Y-%m-%d"),
+        "cont_flag": "1",
+    }
+
+    resp = fyers.history(data=data)
+    if resp.get("s") != "ok" or not resp.get("candles"):
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+    df = pd.DataFrame(
+        resp["candles"],
+        columns=["timestamp", "open", "high", "low", "close", "volume"]
+    )
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
+    df = df.astype({"open": float, "high": float, "low": float,
+                    "close": float, "volume": float})
+    df = df.set_index("timestamp").sort_index()
+    return df
+# ---------- TRADING DAY HELPERS ----------
 
 def is_trading_day(date_obj) -> bool:
-    """Return True if given date is a regular NSE trading day."""
-    return date_obj.weekday() < 5 and date_obj.isoformat() not in indian_market_holidays
-
-def get_last_trading_day(reference_day):
-    """Walk backward from reference_day until a valid trading day is found."""
-    day = reference_day
-    while not is_trading_day(day):
-        day -= timedelta(days=1)
-    return day
-
-def _get_session_mode():
-    """Determine whether we are in live-market hours or off-market."""
-    now_ist = datetime.now(IST)
-    today = now_ist.date()
-    current_time = now_ist.time()
-    
-    if is_trading_day(today) and MARKET_OPEN <= current_time <= MARKET_CLOSE:
-        return "live", now_ist, today
-    else:
-        return "eod", now_ist, today
-
-def get_ohlc_15min(
-    kite,
-    instrument_token: int,
-    lookback_days: int = 10,
-    min_candles: int = 60,
-    show_debug: bool = False,
-):
-    """Fetch 15-minute OHLCV data (existing function unchanged)."""
-    mode, now_ist, today = _get_session_mode()
-    
-    if mode == "live":
-        from_date = datetime.combine(today - timedelta(days=lookback_days), MARKET_OPEN)
-        to_date = now_ist.replace(tzinfo=None)
-        label = "LIVE intraday"
-    else:
-        last_trading = get_last_trading_day(today)
-        from_date = datetime.combine(last_trading - timedelta(days=lookback_days), MARKET_OPEN)
-        to_date = datetime.combine(last_trading, MARKET_CLOSE)
-        label = f"EOD session ({last_trading.isoformat()})"
-    
+    """
+    Simple trading-day check:
+    - Monday to Friday.
+    - DOES NOT include NSE holiday list (your market-aware window already
+      skips weekends; you can add holidays later if needed).
+    """
+    # date_obj can be datetime.date or datetime
     try:
-        data = kite.historical_data(
-            instrument_token=instrument_token,
-            from_date=from_date,
-            to_date=to_date,
-            interval="15minute",
-        )
-    except Exception as e:
-        st.warning(f"{instrument_token}: Failed to fetch historical data ({label}): {e}")
-        return None
-    
-    df = pd.DataFrame(data)
-    if df.empty:
-        st.warning(f"{instrument_token}: Empty historical data for {label}.")
-        return None
-    
-    df["datetime"] = pd.to_datetime(df["date"])
-    df.set_index("datetime", inplace=True)
-    df = df[["open", "high", "low", "close", "volume"]]
-    
-    if df.shape[0] < min_candles:
-        if show_debug:
-            st.warning(
-                f"{instrument_token}: Only {df.shape[0]} candles fetched "
-                f"(min recommended {min_candles}) for {label}."
-            )
-        return df
-    
-    if show_debug:
-        last_ts = df.index[-1]
-        st.write(
-            f"{instrument_token}: Using {df.shape[0]} candles up to "
-            f"{last_ts.strftime('%d %b %Y %H:%M')} IST • {label}"
-        )
-    
-    return df
+        weekday = date_obj.weekday()
+    except AttributeError:
+        # If a string is passed, try to parse
+        date_obj = pd.to_datetime(date_obj).date()
+        weekday = date_obj.weekday()
+    # 0=Monday ... 4=Friday
+    return weekday < 5
 
-def get_ohlc_daily(
-    kite,
-    instrument_token: int,
-    lookback_days: int = 252,
-    min_candles: int = 100,
-    show_debug: bool = False,
-):
-    """Fetch daily OHLCV data for longer-term context."""
-    mode, now_ist, today = _get_session_mode()
-    
-    if mode == "live":
-        from_date = datetime.combine(today - timedelta(days=lookback_days), time(0, 0))
-        to_date = now_ist.replace(tzinfo=None)
-        label = "LIVE daily"
-    else:
-        last_trading = get_last_trading_day(today)
-        from_date = datetime.combine(last_trading - timedelta(days=lookback_days), time(0, 0))
-        to_date = datetime.combine(last_trading + timedelta(days=1), time(0, 0))
-        label = f"EOD daily ({last_trading.isoformat()})"
-    
-    try:
-        data = kite.historical_data(
-            instrument_token=instrument_token,
-            from_date=from_date,
-            to_date=to_date,
-            interval="day",
-        )
-    except Exception as e:
-        if show_debug:
-            st.warning(f"{instrument_token}: Daily fetch failed ({label}): {e}")
-        return None
-    
-    df = pd.DataFrame(data)
-    if df.empty:
-        if show_debug:
-            st.warning(f"{instrument_token}: Empty daily data for {label}.")
-        return None
-    
-    df["datetime"] = pd.to_datetime(df["date"])
-    df.set_index("datetime", inplace=True)
-    df = df[["open", "high", "low", "close", "volume"]]
-    
-    if df.shape[0] < min_candles:
-        if show_debug:
-            st.warning(
-                f"{instrument_token}: Only {df.shape[0]} daily candles "
-                f"(min {min_candles}) for {label}."
-            )
-        return df
-    
-    if show_debug:
-        last_ts = df.index[-1]
-        st.write(
-            f"{instrument_token}: {df.shape[0]} daily candles up to "
-            f"{last_ts.strftime('%d %b %Y')} • {label}"
-        )
-    
-    return df
 
-def build_instrument_token_map(
-    kite,
-    symbols,
-    exchange: str = "NSE",
-    chunk_size: int = 50,
-):
-    """Resolve NSE symbols to instrument tokens (unchanged)."""
-    token_map = {}
-    instruments = [f"{exchange}:{s}" for s in symbols]
-    
-    for i in range(0, len(instruments), chunk_size):
-        chunk = instruments[i : i + chunk_size]
-        try:
-            ltp_data = kite.ltp(chunk)
-        except Exception as e:
-            st.warning(f"Failed to fetch LTP for {chunk}: {e}")
-            continue
-        
-        for inst, payload in ltp_data.items():
-            symbol = inst.split(":")[1]
-            token = payload.get("instrument_token")
-            if token:
-                token_map[symbol] = token
-    
-    missing = [s for s in symbols if s not in token_map]
-    if missing:
-        st.warning(f"No instrument token found for: {', '.join(missing)}")
-    
-    return token_map
+def get_last_trading_day(today) -> datetime.date:
+    """
+    Return the most recent trading day on or before `today`.
+    Weekend-aware only.
+    """
+    if isinstance(today, str):
+        today = pd.to_datetime(today).date()
+    elif isinstance(today, datetime):
+        today = today.date()
+
+    d = today
+    # Walk backwards until a weekday (Mon–Fri)
+    while not is_trading_day(d):
+        d = d - timedelta(days=1)
+    return d
+
+
+# ---------- PLACEHOLDERS FOR OLD ZERODHA API ----------
+
+def build_instrument_token_map(kite, symbols) -> Dict[str, int]:
+    """
+    Legacy placeholder kept for compatibility.
+
+    Your new Fyers-based code does NOT need Zerodha tokens,
+    but some parts of the app still call this. We simply return
+    a dict mapping symbol → dummy token (index).
+
+    Example:
+        {"RELIANCE": 1, "TCS": 2, ...}
+    """
+    return {sym: i + 1 for i, sym in enumerate(symbols)}
