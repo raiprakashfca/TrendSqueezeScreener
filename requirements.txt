@@ -7,7 +7,7 @@ oauth2client
 openpyxl
 requests
 streamlit-autorefresh
-
+fyers-apiv3
 # Optional charting
 matplotlib
 plotly
@@ -18,3 +18,4 @@ pdfkit
 
 # Optional UI enhancements
 streamlit-option-menu
+
