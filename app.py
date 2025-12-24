@@ -494,6 +494,15 @@ with live_tab:
         "✅ **Market-aware**: Skips weekends/holidays automatically. "
         "Always shows relevant trading signals, not calendar time."
     )
+if not fyersok:
+    st.error("🔴 FYERS DEAD - Check secrets.toml:")
+    st.code("""
+fyersappid = "YOUR_ID_HERE"
+fyersaccesstoken = "YOUR_TOKEN_HERE"  
+gcpserviceaccount = '''{json}'''
+    """)
+    st.stop()
+
 # BACKTEST TAB - FULLY ENABLED
 def run_backtest_15m(symbols, days_back=30, params=None):
     if params is None:
@@ -612,3 +621,4 @@ with backtest_tab:
 
 st.markdown("---")
 st.caption("✅ Fyers-powered: real-time data + dual timeframe + market-aware signals + full backtest.")
+
