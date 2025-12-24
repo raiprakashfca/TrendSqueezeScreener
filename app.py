@@ -13,6 +13,8 @@ import gspread
 from gspread.exceptions import SpreadsheetNotFound, APIError
 from oauth2client.service_account import ServiceAccountCredentials
 
+from fyers_apiv3 import fyersModel
+
 from utils.zerodha_utils import (
     init_fyers_session,
     get_ohlc_15min,
@@ -59,23 +61,37 @@ SIGNAL_COLUMNS = [
 
 # ---------- FYERS SESSION INIT (MATCHES YOUR SECRETS) ----------
 fyers_ok = False
+fyers_source = "Unknown"
+fyers_health_ok = False
+fyers_health_msg = "Not checked"
+
 try:
-    fyappid = st.secrets["fyers_app_id"]
-    fyaccesstoken = st.secrets["fyers_secret"]  # (your naming; this is actually the access token)
-    init_fyers_session(fyappid, fyaccesstoken)
+    fyappid, fyaccesstoken, fyers_source = load_fyers_credentials()
+    if not fyappid or not fyaccesstoken:
+        raise RuntimeError(
+            "Missing FYERS credentials. Provide fyers_app_id + fyers_secret in Streamlit secrets, "
+            "or configure FYERS_TOKEN_SHEET_KEY / FYERS_TOKEN_SHEET_NAME to load from Google Sheet."
+        )
 
-    # Optional: force a tiny smoke-test so "Connected" isn't a placebo
-    _ = get_ohlc_daily("RELIANCE", lookback_days=5)
-
+    init_fyers_session(str(fyappid), str(fyaccesstoken))
     fyers_ok = True
-    st.success("✅ Fyers API Connected")
+
+    # Token validity / API health check (cached)
+    fyers_health_ok, fyers_health_msg = fyers_smoke_test()
+
+    if fyers_health_ok:
+        st.success(f"✅ Fyers API Connected ({fyers_source})")
+    else:
+        st.warning(f"⚠️ Fyers connected but data fetch failed ({fyers_source}): {fyers_health_msg}")
+
 except Exception as e:
     st.error(f"🔴 Fyers init failed: {str(e)[:200]}")
     st.info(
-        "Fix your Streamlit secrets. Expected keys:\n"
-        "- fyers_app_id\n"
-        "- fyers_secret (access token)\n"
-        "- gcp_service_account (service account json / dict)"
+        "Expected configuration:\n"
+        "- gcp_service_account (for Google Sheet access)\n"
+        "- Either:\n"
+        "   • fyers_app_id + fyers_secret (access token) in Streamlit secrets, OR\n"
+        "   • FYERS_TOKEN_SHEET_KEY / FYERS_TOKEN_SHEET_NAME (token stored in a Google Sheet)\n"
     )
     st.stop()
 
@@ -200,6 +216,182 @@ def get_gspread_client():
         return client, None
     except Exception as e:
         return None, f"gspread auth failed: {e}"
+
+# ---------------- FYERS token sheet helpers ----------------
+def open_sheet_by_key_or_name(client: gspread.Client):
+    if FYERS_TOKEN_SHEET_KEY:
+        return client.open_by_key(FYERS_TOKEN_SHEET_KEY)
+    if FYERS_TOKEN_SHEET_NAME:
+        return client.open(FYERS_TOKEN_SHEET_NAME)
+    raise RuntimeError("Missing FYERS_TOKEN_SHEET_KEY / FYERS_TOKEN_SHEET_NAME in secrets.")
+
+def ensure_fyers_token_headers(ws):
+    header = ws.row_values(1)
+    if not header:
+        ws.update("A1", [FYERS_TOKEN_HEADERS])
+        return
+    # extend header if missing
+    need = FYERS_TOKEN_HEADERS
+    if header[:len(need)] != need:
+        # overwrite first row with expected headers (safe for this single-sheet purpose)
+        ws.update("A1", [need])
+
+def read_fyers_row(ws):
+    records = ws.get_all_records()
+    if not records:
+        return {"fyers_app_id":"","fyers_secret_id":"","fyers_access_token":"","fyers_token_updated_at":""}
+    r = records[0]
+    # allow your option-B headers
+    return {
+        "fyers_app_id": r.get("fyers_app_id","") or r.get("app_id","") or r.get("client_id",""),
+        "fyers_secret_id": r.get("fyers_secret_id","") or r.get("secret_id","") or r.get("secret_key",""),
+        "fyers_access_token": r.get("fyers_access_token","") or r.get("access_token","") or r.get("token",""),
+        "fyers_token_updated_at": r.get("fyers_token_updated_at","") or r.get("updated_at","") or r.get("timestamp",""),
+    }
+
+def upsert_fyers_row(ws, app_id:str, secret_id:str, access_token:str, updated_at:str):
+    # Ensure at least one data row exists at row 2
+    values = [app_id, secret_id, access_token, updated_at]
+    existing = ws.get_all_values()
+    if len(existing) < 2:
+        ws.append_row(values, value_input_option="USER_ENTERED")
+    else:
+        ws.update("A2", [values])
+
+def build_fyers_auth_url(app_id:str, secret_id:str) -> str:
+    if not FYERS_REDIRECT_URI:
+        raise RuntimeError("Missing FYERS_REDIRECT_URI in secrets. Add FYERS_REDIRECT_URI = '<your redirect url>'.")
+    session = fyersModel.SessionModel(
+        client_id=app_id,
+        secret_key=secret_id,
+        redirect_uri=FYERS_REDIRECT_URI,
+        response_type="code",
+        grant_type="authorization_code",
+        state="trend_squeeze",
+        scope="",
+        nonce=""
+    )
+    return session.generate_authcode()
+
+def exchange_auth_code_for_token(app_id:str, secret_id:str, auth_code:str) -> str:
+    if not FYERS_REDIRECT_URI:
+        raise RuntimeError("Missing FYERS_REDIRECT_URI in secrets. Add FYERS_REDIRECT_URI = '<your redirect url>'.")
+    session = fyersModel.SessionModel(
+        client_id=app_id,
+        secret_key=secret_id,
+        redirect_uri=FYERS_REDIRECT_URI,
+        response_type="code",
+        grant_type="authorization_code",
+        state="trend_squeeze",
+        scope="",
+        nonce=""
+    )
+    session.set_token(auth_code)
+    resp = session.generate_token()
+    # library returns dict; access token key is usually 'access_token'
+    token = resp.get("access_token") or resp.get("accessToken") or resp.get("token")
+    if not token:
+        raise RuntimeError(f"Token generation failed. Response keys: {list(resp.keys())}")
+    return token
+
+
+
+# ---------- FYERS TOKEN LOADER (REUSE SAME GSHEET LOGIC) ----------
+def load_fyers_credentials() -> tuple[str | None, str | None, str]:
+    """
+    Returns (app_id, access_token, source_label)
+    Priority:
+      1) Google Sheet (if FYERS_TOKEN_SHEET_KEY or FYERS_TOKEN_SHEET_NAME is set)
+      2) Streamlit secrets: fyers_app_id + fyers_secret (access token)
+
+    Google Sheet supported formats:
+      A) Header row + first data row with columns:
+         app_id / fyers_app_id / client_id  AND  access_token / fyers_access_token / token
+      B) Simple cells:
+         A1 = app_id, B1 = access_token
+    """
+    app_id = None
+    token = None
+
+    # 1) Try Google Sheet (preferred if configured)
+    sheet_key = None
+    sheet_name = None
+    try:
+        sheet_key = st.secrets.get("FYERS_TOKEN_SHEET_KEY")  # key/id string
+        sheet_name = st.secrets.get("FYERS_TOKEN_SHEET_NAME")  # human name
+    except Exception:
+        sheet_key = None
+        sheet_name = None
+
+    if sheet_key or sheet_name:
+        client, err = get_gspread_client()
+        if not err and client is not None:
+            try:
+                sh = client.open_by_key(sheet_key) if sheet_key else client.open(sheet_name)  # type: ignore[arg-type]
+                ws = sh.sheet1
+
+                # Format A: header + first row
+                records = ws.get_all_records()
+                if records:
+                    row0 = records[0]
+                    app_id = (
+                        row0.get("app_id")
+                        or row0.get("APP_ID")
+                        or row0.get("fyers_app_id")
+                        or row0.get("FYERS_APP_ID")
+                        or row0.get("client_id")
+                        or row0.get("CLIENT_ID")
+                    )
+                    token = (
+                        row0.get("access_token")
+                        or row0.get("ACCESS_TOKEN")
+                        or row0.get("fyers_access_token")
+                        or row0.get("FYERS_ACCESS_TOKEN")
+                        or row0.get("token")
+                        or row0.get("TOKEN")
+                    )
+
+                # Format B: A1/B1 cells
+                if not app_id:
+                    try:
+                        app_id = (ws.acell("A1").value or "").strip() or None
+                    except Exception:
+                        pass
+                if not token:
+                    try:
+                        token = (ws.acell("B1").value or "").strip() or None
+                    except Exception:
+                        pass
+
+                if app_id and token:
+                    return str(app_id).strip(), str(token).strip(), "Google Sheet"
+            except Exception:
+                # Fall through to secrets
+                pass
+
+    # 2) Fallback to Streamlit secrets
+    try:
+        app_id = st.secrets.get("fyers_app_id")
+        token = st.secrets.get("fyers_secret")  # your naming; this is the access token
+    except Exception:
+        app_id, token = None, None
+
+    return (str(app_id).strip() if app_id else None), (str(token).strip() if token else None), "Streamlit secrets"
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fyers_smoke_test() -> tuple[bool, str]:
+    """
+    Lightweight health check: attempts a tiny OHLC fetch.
+    Cached to avoid hammering API on every re-render.
+    """
+    try:
+        _ = get_ohlc_daily("RELIANCE", lookback_days=5)
+        return True, "OK"
+    except Exception as e:
+        msg = str(e)
+        return False, (msg[:160] + "…") if len(msg) > 160 else msg
+
 
 def get_signals_worksheet(sheet_name: str):
     client, err = get_gspread_client()
@@ -352,7 +544,82 @@ with live_tab:
 
     with st.sidebar:
         st.subheader("⚙️ Settings")
+        st.markdown("### 🔐 Fyers Token Status")
+        if fyers_ok:
+            if fyers_health_ok:
+                st.success(f"Token valid • Source: {fyers_source}")
+            else:
+                st.error("Token invalid/expired OR data fetch failing")
+                st.caption(f"Details: {fyers_health_msg}")
+            st.caption(f"Last checked: {now_ist().strftime('%d %b %Y • %H:%M:%S')} IST")
+            st.caption("Tip: Update token daily (best: put it in your FYERS token Google Sheet).")
+        else:
+            st.error("Fyers not initialized")
+        st.markdown("---")
+
         show_debug = st.checkbox("Show debug messages", value=False)
+
+
+        st.markdown("---")
+        st.subheader("🔐 FYERS Token Manager")
+        st.write(fyers_status_msg)
+        if fyers_source == "sheet":
+            st.caption(f"Source: Google Sheet • Updated: {sheet_token_ts or '—'}")
+        else:
+            st.caption("Source: Streamlit secrets")
+
+        if fyers_init_error and show_debug:
+            st.warning(f"FYERS detail: {fyers_init_error}")
+
+        # Token generation requires: sheet app_id + secret_id + FYERS_REDIRECT_URI in secrets
+        if (FYERS_TOKEN_SHEET_KEY or FYERS_TOKEN_SHEET_NAME) and gerr is None:
+            try:
+                if sheet_app_id:
+                    st.caption(f"Sheet app_id: {sheet_app_id}")
+                if sheet_secret_id:
+                    st.caption("Sheet secret_id: ✅ present")
+                else:
+                    st.caption("Sheet secret_id: ❌ missing (fill fyers_secret_id in sheet)")
+
+                if FYERS_REDIRECT_URI:
+                    st.caption("Redirect URI: ✅ configured")
+                else:
+                    st.caption("Redirect URI: ❌ add FYERS_REDIRECT_URI in secrets")
+
+                if st.button("Generate Login URL", use_container_width=True):
+                    if not sheet_app_id or not sheet_secret_id:
+                        st.error("Fill fyers_app_id and fyers_secret_id in your FYERS token sheet first.")
+                    else:
+                        url = build_fyers_auth_url(sheet_app_id, sheet_secret_id)
+                        st.session_state["fyers_login_url"] = url
+
+                if "fyers_login_url" in st.session_state:
+                    st.link_button("Open FYERS Login", st.session_state["fyers_login_url"], use_container_width=True)
+                    st.caption("After login, copy the **auth_code** from the redirected URL and paste below.")
+
+                auth_code = st.text_input("Paste auth_code here")
+                if st.button("Exchange & Save Token", type="primary", use_container_width=True):
+                    if not sheet_app_id or not sheet_secret_id:
+                        st.error("Sheet missing fyers_app_id / fyers_secret_id.")
+                    elif not auth_code.strip():
+                        st.error("Paste auth_code first.")
+                    else:
+                        new_token = exchange_auth_code_for_token(sheet_app_id, sheet_secret_id, auth_code.strip())
+                        ts = now_ist().strftime("%Y-%m-%d %H:%M:%S")
+                        sh = open_sheet_by_key_or_name(client)
+                        ws_tok = sh.sheet1
+                        ensure_fyers_token_headers(ws_tok)
+                        upsert_fyers_row(ws_tok, sheet_app_id, sheet_secret_id, new_token, ts)
+                        st.success("Saved new access token to sheet ✅")
+                        st.info("Reload the app to start using the fresh token.")
+            except Exception as e:
+                if show_debug:
+                    st.error(f"Token manager error: {e}")
+                else:
+                    st.caption("Token manager not ready. Enable debug for details.")
+        else:
+            st.caption("To enable auto token storage: set FYERS_TOKEN_SHEET_KEY in secrets and share the sheet with service account.")
+
 
         st.markdown("---")
         st.subheader("📊 Live coherence")
