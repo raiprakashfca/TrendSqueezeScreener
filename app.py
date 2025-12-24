@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 from datetime import datetime, time, timedelta
@@ -559,12 +560,40 @@ with live_tab:
             min_value=6, max_value=48, value=24, step=6,
             help="App auto-adjusts for weekends/holidays to show relevant trading signals."
         )
-        st.info("**Continuation only**: Bullish Squeeze → LONG | Bearish Squeeze → SHORT")
+        st.info("**Continuation logic**: Bullish → LONG | Bearish → SHORT. Use *Breakout Confirmed* to avoid consolidation chop.")
 
         param_profile = st.selectbox(
             "Parameter Profile",
             ["Normal", "Conservative", "Aggressive"],
             help="Conservative: tighter filters | Aggressive: more signals"
+        )
+
+        st.markdown("---")
+        st.subheader("🧨 Breakout confirmation (recommended)")
+        signal_mode = st.radio(
+            "Signal type",
+            ["✅ Breakout Confirmed (trade)", "🟡 Setup Forming (watchlist)"],
+            index=0,
+            help="Breakout Confirmed waits for consolidation range break (and optional expansion). Setup Forming is early and can chop you."
+        )
+        breakout_lookback = st.slider(
+            "Consolidation range lookback (candles)",
+            min_value=10, max_value=60, value=20, step=5,
+            help="Defines the box. Breakout requires close above prior range high (LONG) or below prior range low (SHORT)."
+        )
+        require_bbw_expansion = st.checkbox(
+            "Require BBW expansion on breakout",
+            value=True,
+            help="Filters false breakouts: requires BBW to rise vs previous candle."
+        )
+        require_volume_spike = st.checkbox(
+            "Require volume spike (if volume is available)",
+            value=False,
+            help="Stricter. Only applies if your OHLC feed includes volume."
+        )
+        volume_spike_mult = st.slider(
+            "Volume spike multiplier (vs 20 SMA)",
+            min_value=1.0, max_value=3.0, value=1.5, step=0.1
         )
 
     if param_profile == "Conservative":
@@ -600,6 +629,9 @@ with live_tab:
         rsi_bear = st.slider("RSI bear threshold", 30.0, 50.0, rsi_bear_default, step=1.0)
 
     params_hash = params_to_hash(bbw_abs_threshold, bbw_pct_threshold, adx_threshold, rsi_bull, rsi_bear)
+
+    # Breakout-confirmed signals are what you trade. Setup-forming is what you watch.
+    use_setup_col = "setup" if signal_mode.startswith("✅") else "setup_forming"
 
     smart_retention_15m = get_market_aware_window(retention_hours)
     smart_retention_daily = get_market_aware_window(retention_hours, "Daily")
@@ -651,20 +683,24 @@ with live_tab:
                 rsi_bull=rsi_bull,
                 rsi_bear=rsi_bear,
                 rolling_window=20,
+                breakout_lookback=breakout_lookback,
+                require_bbw_expansion=require_bbw_expansion,
+                require_volume_spike=require_volume_spike,
+                volume_spike_mult=volume_spike_mult,
             )
 
             recent = df_prepped.tail(int(catchup_candles_15m)).copy()
-            recent = recent[recent["setup"] != ""]
+            recent = recent[recent[use_setup_col] != ""]
             for candle_ts, r in recent.iterrows():
                 signal_time = to_ist(candle_ts).floor("15min").strftime("%Y-%m-%d %H:%M")
-                setup = r["setup"]
+                setup = r[use_setup_col]
                 trend = r.get("trend", "")
                 ltp = float(r.get("close", np.nan))
                 bbw = float(r.get("bbw", np.nan))
                 bbw_rank = r.get("bbw_pct_rank", np.nan)
                 rsi_val = float(r.get("rsi", np.nan))
                 adx_val = float(r.get("adx", np.nan))
-                bias = "LONG" if setup == "Bullish Squeeze" else "SHORT"
+                bias = "LONG" if str(setup).startswith("Bullish") else "SHORT"
                 key = f"{symbol}|15M|Continuation|{signal_time}|{setup}|{bias}"
                 if key not in existing_keys_15m:
                     quality = compute_quality_score(r)
@@ -695,20 +731,24 @@ with live_tab:
                 rsi_bull=rsi_bull,
                 rsi_bear=rsi_bear,
                 rolling_window=20,
+                breakout_lookback=breakout_lookback,
+                require_bbw_expansion=require_bbw_expansion,
+                require_volume_spike=require_volume_spike,
+                volume_spike_mult=volume_spike_mult,
             )
 
             recent_daily = df_daily_prepped.tail(5).copy()
-            recent_daily = recent_daily[recent_daily["setup"] != ""]
+            recent_daily = recent_daily[recent_daily[use_setup_col] != ""]
             for candle_ts, r in recent_daily.iterrows():
                 signal_time = to_ist(candle_ts).floor("1D").strftime("%Y-%m-%d")
-                setup = r["setup"]
+                setup = r[use_setup_col]
                 trend = r.get("trend", "")
                 ltp = float(r.get("close", np.nan))
                 bbw = float(r.get("bbw", np.nan))
                 bbw_rank = r.get("bbw_pct_rank", np.nan)
                 rsi_val = float(r.get("rsi", np.nan))
                 adx_val = float(r.get("adx", np.nan))
-                bias = "LONG" if setup == "Bullish Squeeze" else "SHORT"
+                bias = "LONG" if str(setup).startswith("Bullish") else "SHORT"
                 key = f"{symbol}|Daily|Continuation|{signal_time}|{setup}|{bias}"
                 if key not in existing_keys_daily:
                     quality = compute_quality_score(r)
@@ -775,6 +815,10 @@ with backtest_tab:
                     rsi_bull=params["rsi_bull"],
                     rsi_bear=params["rsi_bear"],
                     rolling_window=20,
+                breakout_lookback=breakout_lookback,
+                require_bbw_expansion=require_bbw_expansion,
+                require_volume_spike=require_volume_spike,
+                volume_spike_mult=volume_spike_mult,
                 )
 
                 signals = df_prepped[df_prepped["setup"] != ""]
