@@ -95,6 +95,17 @@ def ts_to_sheet_str(ts) -> str:
         return ts.strftime("%Y-%m-%d %H:%M")
     return str(ts)
 
+
+def to_ist(ts) -> pd.Timestamp:
+    """Normalize a timestamp (naive/aware) to IST (Asia/Kolkata) and drop tzinfo for display/storage."""
+    t = pd.Timestamp(ts)
+    if t.tzinfo is not None:
+        t = t.tz_convert("Asia/Kolkata").tz_localize(None)
+    else:
+        # Treat naive timestamps as IST already
+        t = t.tz_localize(None)
+    return t
+
 # -------------------- Google Sheets Auth --------------------
 def get_gspread_client():
     try:
@@ -308,6 +319,8 @@ def fetch_existing_keys_recent(ws, days_back: int = 3) -> set:
     if "key" not in df.columns or "signal_time" not in df.columns:
         return set(df.get("key", pd.Series(dtype=str)).astype(str).tolist())
     df["signal_time_dt"] = pd.to_datetime(df["signal_time"], errors="coerce")
+    # Stored sheet times are IST strings; keep them as naive IST for display/filtering.
+
     cutoff = now_ist().replace(tzinfo=None) - timedelta(days=days_back)
     df = df[df["signal_time_dt"].notna()]
     df = df[df["signal_time_dt"] >= cutoff]
@@ -386,6 +399,8 @@ def load_recent_signals(ws, base_hours: int = 24, timeframe: str = "15M") -> pd.
             df[c] = None
 
     df["signal_time_dt"] = pd.to_datetime(df["signal_time"], errors="coerce")
+    # Stored sheet times are IST strings; keep them as naive IST for display/filtering.
+
     df = df[df["signal_time_dt"].notna()]
 
     smart_hours = get_market_aware_window(base_hours, timeframe)
@@ -649,7 +664,7 @@ with live_tab:
             recent = df_prepped.tail(int(catchup_candles_15m)).copy()
             recent = recent[recent["setup"] != ""]
             for candle_ts, r in recent.iterrows():
-                signal_time = pd.Timestamp(candle_ts).floor("15min").strftime("%Y-%m-%d %H:%M")
+                signal_time = to_ist(candle_ts).floor(\"15min\").strftime(\"%Y-%m-%d %H:%M\")
                 setup = r["setup"]
                 trend = r.get("trend", "")
                 ltp = float(r.get("close", np.nan))
@@ -693,7 +708,7 @@ with live_tab:
             recent_daily = df_daily_prepped.tail(5).copy()
             recent_daily = recent_daily[recent_daily["setup"] != ""]
             for candle_ts, r in recent_daily.iterrows():
-                signal_time = pd.Timestamp(candle_ts).floor("1D").strftime("%Y-%m-%d")
+                signal_time = to_ist(candle_ts).floor(\"1D\").strftime(\"%Y-%m-%d\")
                 setup = r["setup"]
                 trend = r.get("trend", "")
                 ltp = float(r.get("close", np.nan))
