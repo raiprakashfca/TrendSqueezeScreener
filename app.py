@@ -630,8 +630,10 @@ with live_tab:
     # 15M scan
     for symbol in stock_list:
         try:
-            df = get_ohlc_15min(symbol, days_back=7)
-            if df is None or df.shape[0] < 60:
+            df = get_ohlc_15min(symbol, days_back=15)
+            # Need enough candles for stable EMA200 on 15M (~200 bars). 15 trading days is usually enough,
+            # but thin data / holidays can still reduce count.
+            if df is None or df.shape[0] < 220:
                 continue
 
             df_prepped = prepare_trend_squeeze(
