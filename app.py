@@ -59,7 +59,7 @@ SIGNAL_COLUMNS = [
 # ---------- FYERS SESSION INIT (SINGLE BLOCK) ----------
 fyers_ok = False
 try:
-    fyappid = st.secrets["fyersappid"]
+    fyappid = st.secrets["fyers_app_id"]
     fyaccesstoken = st.secrets["fyersaccesstoken"]
     init_fyers_session(fyappid, fyaccesstoken)
     fyers_ok = True
@@ -580,7 +580,7 @@ with backtest_tab:
 
     if st.button("🚀 Run Backtest", type="primary"):
         if not fyers_ok:
-            st.error("Fyers is not initialized. Check fyersappid / fyersaccesstoken in secrets.")
+            st.error("Fyers is not initialized. Check fyers_app_id / fyersaccesstoken in secrets.")
         else:
             with st.spinner("Running backtest on Fyers data..."):
                 bt_results, total_bars = run_backtest_15m(
@@ -610,3 +610,4 @@ with backtest_tab:
 
 st.markdown("---")
 st.caption("✅ Fyers-powered: real-time data + dual timeframe + market-aware signals + full backtest.")
+
