@@ -494,14 +494,22 @@ with live_tab:
         "✅ **Market-aware**: Skips weekends/holidays automatically. "
         "Always shows relevant trading signals, not calendar time."
     )
+# ---------- FYERS SESSION INIT ----------
+fyersok = False  # FIX: Declare FIRST
+try:
+    fyappid = st.secrets["fyersappid"]
+    fyaccess = st.secrets["fyersaccesstoken"]
+    from utils.zerodha_utils import init_fyers_session
+    init_fyers_session(fyappid, fyaccess)
+    fyersok = True
+    st.success("✅ Fyers API Connected")
+except Exception as e:
+    st.error(f"🔴 Fyers init failed: {str(e)[:100]}...")
+    st.info("**Fix secrets.toml:**\n``````")
+
 if not fyersok:
-    st.error("🔴 FYERS DEAD - Check secrets.toml:")
-    st.code("""
-fyersappid = "YOUR_ID_HERE"
-fyersaccesstoken = "YOUR_TOKEN_HERE"  
-gcpserviceaccount = '''{json}'''
-    """)
     st.stop()
+
 
 # BACKTEST TAB - FULLY ENABLED
 def run_backtest_15m(symbols, days_back=30, params=None):
@@ -621,4 +629,5 @@ with backtest_tab:
 
 st.markdown("---")
 st.caption("✅ Fyers-powered: real-time data + dual timeframe + market-aware signals + full backtest.")
+
 
