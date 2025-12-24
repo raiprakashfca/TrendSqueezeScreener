@@ -56,17 +56,17 @@ SIGNAL_COLUMNS = [
     "params_hash",
 ]
 
-# ---------- FYERS SESSION INIT (SINGLE BLOCK) ----------
+# ---------- FYERS SESSION INIT (MATCHES YOUR SECRETS) ----------
 fyers_ok = False
 try:
     fyappid = st.secrets["fyers_app_id"]
-    fyaccesstoken = st.secrets["fyersaccesstoken"]
+    fyaccesstoken = st.secrets["fyers_secret"]
     init_fyers_session(fyappid, fyaccesstoken)
     fyers_ok = True
     st.success("✅ Fyers API Connected")
 except Exception as e:
     st.error(f"🔴 Fyers init failed: {str(e)[:100]}...")
-    st.info("**Fix .streamlit/secrets.toml:**\n``````")
+    st.info("**Your .streamlit/secrets.toml looks correct:**\n``````")
     st.stop()
 
 def now_ist() -> datetime:
@@ -274,12 +274,7 @@ last_trading_day = get_last_trading_day(n.date())
 st.caption(f"🗓️ Last trading day: {last_trading_day.strftime('%d %b %Y')}")
 
 fallback_nifty50 = [
-    "ADANIENT","ADANIPORTS","APOLLOHOSP","ASIANPAINT","AXISBANK","BAJAJ-AUTO","BAJFINANCE",
-    "BAJAJFINSV","BHARTIARTL","BPCL","BRITANNIA","CIPLA","COALINDIA","DIVISLAB","DRREDDY",
-    "EICHERMOT","GRASIM","HCLTECH","HDFCBANK","HINDALCO","HINDUNILVR","ICICIBANK","INDUSINDBK",
-    "INFY","ITC","JSWSTEEL","KOTAKBANK","LT","LTIM","M&M","MARUTI","NESTLEIND","NTPC","ONGC",
-    "POWERGRID","RELIANCE","SBIN","SBILIFE","SUNPHARMA","TATACONSUM","TMPV","TATASTEEL","TCS",
-    "TECHM","TITAN","ULTRACEMCO","UPL","WIPRO","HEROMOTOCO","SHREECEM"
+    "ADANIENT","ADANIPORTS","APOLLOHOSP","ASIANPAINT","AXISBANK","BAJAJ-AUTO","BAJFINANCE","BAJAJFINSV","BHARTIARTL","BPCL","BRITANNIA","CIPLA","COALINDIA","DIVISLAB","DRREDDY","EICHERMOT","GRASIM","HCLTECH","HDFCBANK","HINDALCO","HINDUNILVR","ICICIBANK","INDUSINDBK","INFY","ITC","JSWSTEEL","KOTAKBANK","LT","LTIM","M&M","MARUTI","NESTLEIND","NTPC","ONGC","POWERGRID","RELIANCE","SBIN","SBILIFE","SUNPHARMA","TATACONSUM","TMPV","TATASTEEL","TCS","TECHM","TITAN","ULTRACEMCO","UPL","WIPRO","HEROMOTOCO","SHREECEM"
 ]
 
 stock_list = fallback_nifty50
@@ -389,7 +384,7 @@ with live_tab:
             if df is None or df.shape[0] < 60:
                 continue
             df_prepped = prepare_trend_squeeze(
-                df,
+                df
                 bbw_abs_threshold=bbw_abs_threshold,
                 bbw_pct_threshold=bbw_pct_threshold,
                 adx_threshold=adx_threshold,
@@ -580,7 +575,7 @@ with backtest_tab:
 
     if st.button("🚀 Run Backtest", type="primary"):
         if not fyers_ok:
-            st.error("Fyers is not initialized. Check fyers_app_id / fyersaccesstoken in secrets.")
+            st.error("Fyers is not initialized. Check fyers_app_id / fyers_secret in secrets.")
         else:
             with st.spinner("Running backtest on Fyers data..."):
                 bt_results, total_bars = run_backtest_15m(
@@ -610,4 +605,3 @@ with backtest_tab:
 
 st.markdown("---")
 st.caption("✅ Fyers-powered: real-time data + dual timeframe + market-aware signals + full backtest.")
-
