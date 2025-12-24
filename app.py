@@ -2,7 +2,6 @@ import io
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 import json
-
 import numpy as np
 import pandas as pd
 import requests
@@ -56,6 +55,19 @@ SIGNAL_COLUMNS = [
     "quality_score",
     "params_hash",
 ]
+
+# ---------- FYERS SESSION INIT (SINGLE BLOCK) ----------
+fyers_ok = False
+try:
+    fyappid = st.secrets["fyersappid"]
+    fyaccesstoken = st.secrets["fyersaccesstoken"]
+    init_fyers_session(fyappid, fyaccesstoken)
+    fyers_ok = True
+    st.success("✅ Fyers API Connected")
+except Exception as e:
+    st.error(f"🔴 Fyers init failed: {str(e)[:100]}...")
+    st.info("**Fix .streamlit/secrets.toml:**\n``````")
+    st.stop()
 
 def now_ist() -> datetime:
     return datetime.now(IST)
@@ -128,7 +140,7 @@ def get_market_aware_window(base_hours: int, timeframe: str = "15M") -> int:
         smart_hours *= 24
     return min(smart_hours, base_hours * 2)
 
-# Google Sheets helpers (gcp_service_account is JSON string in secrets)
+# Google Sheets helpers
 def get_gspread_client():
     try:
         raw = st.secrets["gcp_service_account"]
@@ -161,9 +173,7 @@ def get_signals_worksheet(sheet_name):
         else:
             sh = client.open(sheet_name)
     except SpreadsheetNotFound:
-        return None, (
-            f"Sheet '{sheet_name}' not found. Check file name or Sheet ID in app.py."
-        )
+        return None, f"Sheet '{sheet_name}' not found. Check file name or Sheet ID in app.py."
     except Exception as e:
         return None, f"Failed to open sheet '{sheet_name}': {e}"
     try:
@@ -253,15 +263,6 @@ def load_recent_signals(ws, base_hours: int = 24, timeframe: str = "15M") -> pd.
     ]
     return df[cols]
 
-# ---------- FYERS SESSION INIT ----------
-try:
-    fy_app_id = st.secrets["fyers_app_id"]
-    fy_access = st.secrets["fyers_access_token"]
-    init_fyers_session(fy_app_id, fy_access)
-    fyers_ok = True
-except Exception as e:
-    fyers_ok = False
-    st.error(f"Fyers init failed: {e}")
 # UI Header
 st.title("📉 Trend Squeeze Screener (15M + Daily) - Market Aware")
 n = now_ist()
@@ -271,65 +272,6 @@ st.caption(f"{mode_str} • Last refresh: {n.strftime('%d %b %Y • %H:%M:%S')} 
 # Market status display
 last_trading_day = get_last_trading_day(n.date())
 st.caption(f"🗓️ Last trading day: {last_trading_day.strftime('%d %b %Y')}")
-
-with st.sidebar:
-    st.subheader("Settings")
-    show_debug = st.checkbox("Show debug messages", value=False)
-    
-    st.markdown("---")
-    st.subheader("Live coherence")
-    catchup_candles_15m = st.slider(
-        "15M Catch-up window (candles)",
-        min_value=8, max_value=64, value=32, step=4,
-        help="Live scans last N 15m candles and logs any setups it finds (deduped)."
-    )
-    retention_hours = st.slider(
-        "Base retention (calendar hours)",
-        min_value=6, max_value=48, value=24, step=6,
-        help="App auto-adjusts for weekends/holidays to show relevant trading signals."
-    )
-    
-    st.info("**Continuation only**: Bullish Squeeze → LONG | Bearish Squeeze → SHORT")
-    
-    param_profile = st.selectbox(
-        "Parameter Profile",
-        ["Normal", "Conservative", "Aggressive"],
-        help="Conservative: tighter filters | Aggressive: more signals"
-    )
-
-if param_profile == "Conservative":
-    bbw_abs_default, bbw_pct_default = 0.035, 0.25
-    adx_default, rsi_bull_default, rsi_bear_default = 25.0, 60.0, 40.0
-elif param_profile == "Aggressive":
-    bbw_abs_default, bbw_pct_default = 0.065, 0.45
-    adx_default, rsi_bull_default, rsi_bear_default = 18.0, 52.0, 48.0
-else:
-    bbw_abs_default, bbw_pct_default = 0.05, 0.35
-    adx_default, rsi_bull_default, rsi_bear_default = 20.0, 55.0, 45.0
-
-c1, c2 = st.columns(2)
-with c1:
-    bbw_abs_threshold = st.slider(
-        "BBW absolute threshold (max BBW)",
-        0.01, 0.20, bbw_abs_default, step=0.005,
-        help="Lower = tighter squeeze."
-    )
-with c2:
-    bbw_pct_threshold = st.slider(
-        "BBW percentile threshold",
-        0.10, 0.80, bbw_pct_default, step=0.05,
-        help="BBW must be in the bottom X% of last 20 bars."
-    )
-
-c3, c4, c5 = st.columns(3)
-with c3:
-    adx_threshold = st.slider("ADX threshold", 15.0, 35.0, adx_default, step=1.0)
-with c4:
-    rsi_bull = st.slider("RSI bull threshold", 50.0, 70.0, rsi_bull_default, step=1.0)
-with c5:
-    rsi_bear = st.slider("RSI bear threshold", 30.0, 50.0, rsi_bear_default, step=1.0)
-
-params_hash = params_to_hash(bbw_abs_threshold, bbw_pct_threshold, adx_threshold, rsi_bull, rsi_bear)
 
 fallback_nifty50 = [
     "ADANIENT","ADANIPORTS","APOLLOHOSP","ASIANPAINT","AXISBANK","BAJAJ-AUTO","BAJFINANCE",
@@ -347,6 +289,65 @@ live_tab, backtest_tab = st.tabs(["📺 Live Screener (15M + Daily)", "📜 Back
 
 with live_tab:
     st.subheader("📺 Live Screener (15M + Daily • Market-Aware)")
+    
+    with st.sidebar:
+        st.subheader("⚙️ Settings")
+        show_debug = st.checkbox("Show debug messages", value=False)
+        
+        st.markdown("---")
+        st.subheader("📊 Live coherence")
+        catchup_candles_15m = st.slider(
+            "15M Catch-up window (candles)",
+            min_value=8, max_value=64, value=32, step=4,
+            help="Live scans last N 15m candles and logs any setups it finds (deduped)."
+        )
+        retention_hours = st.slider(
+            "Base retention (calendar hours)",
+            min_value=6, max_value=48, value=24, step=6,
+            help="App auto-adjusts for weekends/holidays to show relevant trading signals."
+        )
+        
+        st.info("**Continuation only**: Bullish Squeeze → LONG | Bearish Squeeze → SHORT")
+        
+        param_profile = st.selectbox(
+            "Parameter Profile",
+            ["Normal", "Conservative", "Aggressive"],
+            help="Conservative: tighter filters | Aggressive: more signals"
+        )
+
+    if param_profile == "Conservative":
+        bbw_abs_default, bbw_pct_default = 0.035, 0.25
+        adx_default, rsi_bull_default, rsi_bear_default = 25.0, 60.0, 40.0
+    elif param_profile == "Aggressive":
+        bbw_abs_default, bbw_pct_default = 0.065, 0.45
+        adx_default, rsi_bull_default, rsi_bear_default = 18.0, 52.0, 48.0
+    else:
+        bbw_abs_default, bbw_pct_default = 0.05, 0.35
+        adx_default, rsi_bull_default, rsi_bear_default = 20.0, 55.0, 45.0
+
+    c1, c2 = st.columns(2)
+    with c1:
+        bbw_abs_threshold = st.slider(
+            "BBW absolute threshold (max BBW)",
+            0.01, 0.20, bbw_abs_default, step=0.005,
+            help="Lower = tighter squeeze."
+        )
+    with c2:
+        bbw_pct_threshold = st.slider(
+            "BBW percentile threshold",
+            0.10, 0.80, bbw_pct_default, step=0.05,
+            help="BBW must be in the bottom X% of last 20 bars."
+        )
+
+    c3, c4, c5 = st.columns(3)
+    with c3:
+        adx_threshold = st.slider("ADX threshold", 15.0, 35.0, adx_default, step=1.0)
+    with c4:
+        rsi_bull = st.slider("RSI bull threshold", 50.0, 70.0, rsi_bull_default, step=1.0)
+    with c5:
+        rsi_bear = st.slider("RSI bear threshold", 30.0, 50.0, rsi_bear_default, step=1.0)
+
+    params_hash = params_to_hash(bbw_abs_threshold, bbw_pct_threshold, adx_threshold, rsi_bull, rsi_bear)
     
     smart_retention_15m = get_market_aware_window(retention_hours)
     smart_retention_daily = get_market_aware_window(retention_hours, "Daily")
@@ -420,7 +421,7 @@ with live_tab:
                     new_15m += 1
         except Exception as e:
             if show_debug:
-                st.warning(f"{symbol} 15M: error -> {e}")
+                st.warning(f"{symbol} 15M error: {e}")
             continue
     
     new_daily = 0
@@ -463,7 +464,7 @@ with live_tab:
                     new_daily += 1
         except Exception as e:
             if show_debug:
-                st.warning(f"{symbol} Daily: error -> {e}")
+                st.warning(f"{symbol} Daily error: {e}")
             continue
     
     appended_15m = 0
@@ -494,57 +495,42 @@ with live_tab:
         "✅ **Market-aware**: Skips weekends/holidays automatically. "
         "Always shows relevant trading signals, not calendar time."
     )
-# ---------- FYERS SESSION INIT ----------
-fyersok = False  # FIX: Declare FIRST
-try:
-    fyappid = st.secrets["fyersappid"]
-    fyaccess = st.secrets["fyersaccesstoken"]
-    from utils.zerodha_utils import init_fyers_session
-    init_fyers_session(fyappid, fyaccess)
-    fyersok = True
-    st.success("✅ Fyers API Connected")
-except Exception as e:
-    st.error(f"🔴 Fyers init failed: {str(e)[:100]}...")
-    st.info("**Fix secrets.toml:**\n``````")
 
-if not fyersok:
-    st.stop()
+with backtest_tab:
+    st.markdown("## 📜 Trend Squeeze Backtest (15M)")
 
+    def run_backtest_15m(symbols, days_back=30, params=None):
+        if params is None:
+            params = {
+                "bbw_abs_threshold": 0.05,
+                "bbw_pct_threshold": 0.35,
+                "adx_threshold": 20.0,
+                "rsi_bull": 55.0,
+                "rsi_bear": 45.0,
+            }
+        trades = []
+        total_bars = 0
 
-# BACKTEST TAB - FULLY ENABLED
-def run_backtest_15m(symbols, days_back=30, params=None):
-    if params is None:
-        params = {
-            "bbw_abs_threshold": 0.05,
-            "bbw_pct_threshold": 0.35,
-            "adx_threshold": 20.0,
-            "rsi_bull": 55.0,
-            "rsi_bear": 45.0,
-        }
-    trades = []
-    total_bars = 0
-
-    for symbol in symbols[:10]:
-        try:
-            df = get_ohlc_15min(symbol, days_back=days_back)
-            if df is None or len(df) < 100:
-                continue
-            df_prepped = prepare_trend_squeeze(
-                df,
-                bbw_abs_threshold=params["bbw_abs_threshold"],
-                bbw_pct_threshold=params["bbw_pct_threshold"],
-                adx_threshold=params["adx_threshold"],
-                rsi_bull=params["rsi_bull"],
-                rsi_bear=params["rsi_bear"],
-                rolling_window=20,
-            )
-            signals = df_prepped[df_prepped["setup"] != ""]
-            total_bars += len(df_prepped)
-            for ts, row in signals.iterrows():
-                bias = "LONG" if row["setup"] == "Bullish Squeeze" else "SHORT"
-                entry = float(row["close"])
-                trades.append(
-                    {
+        for symbol in symbols[:10]:
+            try:
+                df = get_ohlc_15min(symbol, days_back=days_back)
+                if df is None or len(df) < 100:
+                    continue
+                df_prepped = prepare_trend_squeeze(
+                    df,
+                    bbw_abs_threshold=params["bbw_abs_threshold"],
+                    bbw_pct_threshold=params["bbw_pct_threshold"],
+                    adx_threshold=params["adx_threshold"],
+                    rsi_bull=params["rsi_bull"],
+                    rsi_bear=params["rsi_bear"],
+                    rolling_window=20,
+                )
+                signals = df_prepped[df_prepped["setup"] != ""]
+                total_bars += len(df_prepped)
+                for ts, row in signals.iterrows():
+                    bias = "LONG" if row["setup"] == "Bullish Squeeze" else "SHORT"
+                    entry = float(row["close"])
+                    trades.append({
                         "Symbol": symbol,
                         "Time": fmt_ts(ts),
                         "Bias": bias,
@@ -553,16 +539,11 @@ def run_backtest_15m(symbols, days_back=30, params=None):
                         "RSI": float(row.get("rsi", np.nan)),
                         "ADX": float(row.get("adx", np.nan)),
                         "Quality": compute_quality_score(row),
-                    }
-                )
-        except Exception:
-            continue
+                    })
+            except Exception:
+                continue
 
-    return pd.DataFrame(trades), total_bars
-
-
-with backtest_tab:
-    st.markdown("## 📜 Trend Squeeze Backtest (15M)")
+        return pd.DataFrame(trades), total_bars
 
     col_bt1, col_bt2, col_bt3 = st.columns(3)
     with col_bt1:
@@ -599,7 +580,7 @@ with backtest_tab:
 
     if st.button("🚀 Run Backtest", type="primary"):
         if not fyers_ok:
-            st.error("Fyers is not initialized. Check fyers_app_id / fyers_access_token in secrets.")
+            st.error("Fyers is not initialized. Check fyersappid / fyersaccesstoken in secrets.")
         else:
             with st.spinner("Running backtest on Fyers data..."):
                 bt_results, total_bars = run_backtest_15m(
@@ -629,5 +610,3 @@ with backtest_tab:
 
 st.markdown("---")
 st.caption("✅ Fyers-powered: real-time data + dual timeframe + market-aware signals + full backtest.")
-
-
