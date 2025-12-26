@@ -1,10 +1,11 @@
+# app.py
 from __future__ import annotations
 
 from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 import json
 import inspect
-import string
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -26,6 +27,7 @@ from utils.zerodha_utils import (
 )
 from utils.strategy import prepare_trend_squeeze
 
+
 # ✅ MUST BE FIRST Streamlit call
 st.set_page_config(page_title="📉 Trend Squeeze Screener", layout="wide")
 st_autorefresh(interval=300000, key="auto_refresh")  # 5 min refresh
@@ -38,7 +40,7 @@ MARKET_CLOSE = time(15, 30)
 SIGNAL_SHEET_15M = "TrendSqueezeSignals_15M"
 SIGNAL_SHEET_DAILY = "TrendSqueezeSignals_Daily"
 
-# Direct Sheet IDs
+# Direct Sheet IDs (from your URLs)
 SHEET_ID_15M = "1RP2tbh6WnMgEDAv5FWXD6GhePXno9bZ81ILFyoX6Fb8"
 SHEET_ID_DAILY = "1u-W5vu3KM6XPRr78o8yyK8pPaAjRUIFEEYKHyYGUsM0"
 
@@ -61,44 +63,45 @@ SIGNAL_COLUMNS = [
     "params_hash",
 ]
 
+
 # -------------------- Helpers: Time --------------------
-def now_ist_aware() -> datetime:
+def now_ist() -> datetime:
     return datetime.now(IST)
 
-def now_ist_naive() -> datetime:
-    return now_ist_aware().replace(tzinfo=None)
-
 def market_open_now() -> bool:
-    n = now_ist_aware()
+    n = now_ist()
     return is_trading_day(n.date()) and MARKET_OPEN <= n.time() <= MARKET_CLOSE
 
 def fmt_dt(dt: datetime) -> str:
     return dt.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
 
-def fmt_ts(ts) -> str:
+def to_ist_naive(ts) -> pd.Timestamp:
+    """
+    After the updated utils/zerodha_utils.py, OHLC index is already IST-naive.
+    This function keeps you safe if something slips in tz-aware.
+    """
     t = pd.Timestamp(ts)
-    # candles now come IST-naive from utils; keep consistent
+    if t.tzinfo is not None:
+        t = t.tz_convert("Asia/Kolkata").tz_localize(None)
+    return t
+
+def fmt_ts(ts) -> str:
+    t = to_ist_naive(ts)
     return t.strftime("%d-%b-%Y %H:%M")
 
-def _col_letter(n: int) -> str:
-    # 1->A, 2->B ...
-    letters = ""
-    while n:
-        n, rem = divmod(n - 1, 26)
-        letters = chr(65 + rem) + letters
-    return letters
+def human_age(dt: pd.Timestamp, now: pd.Timestamp) -> str:
+    delta = now - dt
+    mins = int(delta.total_seconds() // 60)
+    if mins < 60:
+        return f"{mins}m ago"
+    hrs = mins // 60
+    if hrs < 24:
+        return f"{hrs}h ago"
+    days = hrs // 24
+    return f"{days}d ago"
+
 
 # -------------------- Google Sheets Auth --------------------
-@st.cache_resource(show_spinner=False)
-def _gspread_client_cached(sa_json_str: str):
-    scope = [
-        "https://spreadsheets.google.com/feeds",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    sa = json.loads(sa_json_str)
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(sa, scope)
-    return gspread.authorize(creds)
-
 def get_gspread_client():
     try:
         raw = st.secrets["gcp_service_account"]
@@ -107,14 +110,19 @@ def get_gspread_client():
 
     try:
         sa = json.loads(raw) if isinstance(raw, str) else dict(raw)
-        sa_str = json.dumps(sa, sort_keys=True)
     except Exception as e:
         return None, f"Invalid gcp_service_account format: {e}"
 
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive",
+    ]
     try:
-        return _gspread_client_cached(sa_str), None
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(sa, scope)
+        return gspread.authorize(creds), None
     except Exception as e:
         return None, f"gspread auth failed: {e}"
+
 
 # -------------------- FYERS Token Sheet Manager --------------------
 FYERS_TOKEN_HEADERS = ["fyers_app_id", "fyers_secret_id", "fyers_access_token", "fyers_token_updated_at"]
@@ -190,15 +198,12 @@ def ensure_fyers_row_exists(ws):
 
 def update_fyers_token(ws, token: str, timestamp: str):
     header = [h.strip() for h in ws.row_values(1)]
-    changed = False
 
     if "fyers_access_token" not in header:
         header.append("fyers_access_token")
-        changed = True
+        ws.update("A1", [header])
     if "fyers_token_updated_at" not in header:
         header.append("fyers_token_updated_at")
-        changed = True
-    if changed:
         ws.update("A1", [header])
 
     col_token = header.index("fyers_access_token") + 1
@@ -232,31 +237,22 @@ def exchange_auth_code_for_token(app_id: str, secret_id: str, redirect_uri: str,
         raise RuntimeError(f"Token exchange failed: {resp}")
     return str(resp["access_token"]).strip()
 
-# -------------------- OHLC caching (biggest performance win) --------------------
-@st.cache_data(ttl=290, show_spinner=False)  # ~matches 5-min refresh
-def ohlc_15m_cached(symbol: str, days_back: int):
-    return get_ohlc_15min(symbol, days_back=days_back)
-
-@st.cache_data(ttl=6 * 3600, show_spinner=False)  # daily doesn’t change often
-def ohlc_daily_cached(symbol: str, lookback_days: int):
-    return get_ohlc_daily(symbol, lookback_days=lookback_days)
-
 @st.cache_data(ttl=120, show_spinner=False)
 def fyers_smoke_test() -> tuple[bool, str]:
     try:
-        df = ohlc_15m_cached("RELIANCE", days_back=2)
+        df = get_ohlc_15min("RELIANCE", days_back=2)
         if df is None or len(df) < 10:
             return False, "OHLC returned empty/too short"
         return True, "OK"
     except Exception as e:
         return False, str(e)[:200]
 
+
 # -------------------- Sheets for signals logging --------------------
 def get_signals_worksheet(sheet_name: str):
     client, err = get_gspread_client()
     if err:
         return None, err
-
     try:
         if sheet_name == SIGNAL_SHEET_15M and SHEET_ID_15M:
             sh = client.open_by_key(SHEET_ID_15M)
@@ -274,50 +270,35 @@ def get_signals_worksheet(sheet_name: str):
     except Exception as e:
         return None, f"Failed to access sheet1: {e}"
 
-    # Ensure header EXACT match (avoid partial mismatch bugs)
     try:
         header = ws.row_values(1)
-        if header != SIGNAL_COLUMNS:
-            ws.update("A1", [SIGNAL_COLUMNS])
+        if not header:
+            ws.append_row(SIGNAL_COLUMNS)
+        else:
+            if header[: len(SIGNAL_COLUMNS)] != SIGNAL_COLUMNS and len(header) < len(SIGNAL_COLUMNS):
+                ws.update("A1", [SIGNAL_COLUMNS])
     except Exception as e:
         return None, f"Failed to ensure headers: {e}"
 
     return ws, None
 
-def fetch_existing_keys_recent(ws, days_back: int = 3) -> set[str]:
-    """
-    Fast de-dupe: reads only columns A:B (key, signal_time).
-    """
+def fetch_existing_keys_recent(ws, days_back: int = 3) -> set:
     try:
-        rows = ws.get("A:B")
+        records = ws.get_all_records()
     except Exception:
         return set()
-
-    if not rows or len(rows) < 2:
+    if not records:
         return set()
+    df = pd.DataFrame(records)
+    if "key" not in df.columns or "signal_time" not in df.columns:
+        return set(df.get("key", pd.Series(dtype=str)).astype(str).tolist())
 
-    data = rows[1:]  # skip header
-    keys = []
-    times = []
-    for r in data:
-        if not r:
-            continue
-        k = (r[0] if len(r) >= 1 else "") or ""
-        t = (r[1] if len(r) >= 2 else "") or ""
-        if k:
-            keys.append(str(k))
-            times.append(str(t))
+    df["signal_time_dt"] = pd.to_datetime(df["signal_time"], errors="coerce")
+    df = df[df["signal_time_dt"].notna()]
+    df["signal_time_dt"] = df["signal_time_dt"].apply(to_ist_naive)
 
-    if not keys:
-        return set()
-
-    df = pd.DataFrame({"key": keys, "signal_time": times})
-    # parse both "YYYY-MM-DD HH:MM" and "YYYY-MM-DD"
-    df["dt"] = pd.to_datetime(df["signal_time"], errors="coerce")
-    df = df[df["dt"].notna()].copy()
-
-    cutoff = now_ist_naive() - timedelta(days=days_back)
-    df = df[df["dt"] >= cutoff]
+    cutoff = now_ist().replace(tzinfo=None) - timedelta(days=days_back)
+    df = df[df["signal_time_dt"] >= cutoff]
     return set(df["key"].astype(str).tolist())
 
 def append_signals(ws, rows: list[list], show_debug: bool = False) -> tuple[int, str | None]:
@@ -365,7 +346,7 @@ def compute_quality_score(row):
     return "C"
 
 def get_market_aware_window(base_hours: int, timeframe: str = "15M") -> int:
-    now = now_ist_aware()
+    now = now_ist()
     target_date = now.date()
     trading_days_back = 0
     calendar_days_back = 0
@@ -379,42 +360,32 @@ def get_market_aware_window(base_hours: int, timeframe: str = "15M") -> int:
         smart_hours *= 24
     return min(smart_hours, base_hours * 2)
 
-def load_recent_signals(ws, base_hours: int = 24, timeframe: str = "15M", audit_mode: bool = False, max_rows: int = 1500) -> pd.DataFrame:
-    """
-    Faster loader: pulls A:P (used range) and only keeps the last `max_rows`.
-    """
-    last_col = _col_letter(len(SIGNAL_COLUMNS))  # A..P for 16
-    rng = f"A:{last_col}"
-
+def load_recent_signals(ws, base_hours: int = 24, timeframe: str = "15M") -> pd.DataFrame:
     try:
-        values = ws.get(rng)
+        records = ws.get_all_records()
     except Exception:
         return pd.DataFrame()
-
-    if not values or len(values) < 2:
+    if not records:
         return pd.DataFrame()
 
-    header = values[0]
-    rows = values[1:]
-    if len(rows) > max_rows:
-        rows = rows[-max_rows:]
-
-    df = pd.DataFrame(rows, columns=header[: len(rows[0])] if rows else header)
-    # ensure expected cols exist
+    df = pd.DataFrame(records)
     for c in SIGNAL_COLUMNS:
         if c not in df.columns:
             df[c] = None
 
     df["signal_time_dt"] = pd.to_datetime(df["signal_time"], errors="coerce")
-    df = df[df["signal_time_dt"].notna()].copy()
+    df = df[df["signal_time_dt"].notna()]
+    df["signal_time_dt"] = df["signal_time_dt"].apply(to_ist_naive)
 
     smart_hours = get_market_aware_window(base_hours, timeframe)
-    cutoff = now_ist_naive() - timedelta(hours=smart_hours)
+    cutoff = now_ist().replace(tzinfo=None) - timedelta(hours=smart_hours)
     df = df[df["signal_time_dt"] >= cutoff].copy()
     if df.empty:
         return df
 
+    now_local = pd.Timestamp(now_ist().replace(tzinfo=None))
     df["Timestamp"] = df["signal_time_dt"].dt.strftime("%d-%b-%Y %H:%M")
+    df["Age"] = df["signal_time_dt"].apply(lambda x: human_age(pd.Timestamp(x), now_local))
 
     df.rename(
         columns={
@@ -434,70 +405,86 @@ def load_recent_signals(ws, base_hours: int = 24, timeframe: str = "15M", audit_
         inplace=True,
     )
 
+    # Sort: latest first, but we'll also allow Quality-first sorting later
     df = df.sort_values("signal_time_dt", ascending=False)
-    if not audit_mode:
-        df = df.drop_duplicates(subset=["Symbol", "Timeframe"], keep="first")
 
-    cols = ["Timestamp", "Symbol", "Timeframe", "Quality", "Bias", "Setup", "LTP", "BBW", "BBW %Rank", "RSI", "ADX", "Trend"]
+    cols = ["Timestamp", "Age", "Symbol", "Timeframe", "Quality", "Bias", "Setup", "LTP", "BBW", "BBW %Rank", "RSI", "ADX", "Trend"]
     return df[cols]
+
+
+# -------------------- Universe --------------------
+fallback_nifty50 = [
+    "ADANIENT","ADANIPORTS","APOLLOHOSP","ASIANPAINT","AXISBANK","BAJAJ-AUTO","BAJFINANCE","BAJAJFINSV",
+    "BHARTIARTL","BPCL","BRITANNIA","CIPLA","COALINDIA","DIVISLAB","DRREDDY","EICHERMOT","GRASIM","HCLTECH",
+    "HDFCBANK","HINDALCO","HINDUNILVR","ICICIBANK","INDUSINDBK","INFY","ITC","JSWSTEEL","KOTAKBANK","LT","LTIM",
+    "M&M","MARUTI","NESTLEIND","NTPC","ONGC","POWERGRID","RELIANCE","SBIN","SBILIFE","SUNPHARMA","TATACONSUM",
+    "TMPV","TATASTEEL","TCS","TECHM","TITAN","ULTRACEMCO","UPL","WIPRO","HEROMOTOCO","SHREECEM"
+]
+stock_list = fallback_nifty50
+
+
+# ---------- Signature detection (compat safety) ----------
+_STRAT_SIG = inspect.signature(prepare_trend_squeeze)
+_HAS_ENGINE = "engine" in _STRAT_SIG.parameters
+_HAS_BOX_WIDTH = "box_width_pct_max" in _STRAT_SIG.parameters
+_HAS_RSI_FLOOR = "rsi_floor_short" in _STRAT_SIG.parameters
+_HAS_DI = "require_di_confirmation" in _STRAT_SIG.parameters
+_HAS_ADX_USE_FILTER = "adx_use_as_filter" in _STRAT_SIG.parameters
+
 
 # -------------------- Sidebar: Token Manager UI --------------------
 with st.sidebar:
-    st.subheader("🔐 FYERS Token Status")
-
-    ws_fyers, ws_fyers_err = None, None
-    try:
-        ws_fyers, ws_fyers_err = get_fyers_token_worksheet()
-    except Exception as e:
-        ws_fyers, ws_fyers_err = None, str(e)
-
-    app_id_sheet = secret_id_sheet = token_sheet = updated_at_sheet = ""
+    st.subheader("🔐 FYERS Token")
+    ws_fyers, ws_fyers_err = get_fyers_token_worksheet()
 
     if ws_fyers_err:
         st.error("FYERS token sheet ❌")
         st.caption(ws_fyers_err)
+        app_id_sheet = secret_id_sheet = token_sheet = updated_at_sheet = ""
     else:
         app_id_sheet, secret_id_sheet, token_sheet, updated_at_sheet = read_fyers_row(ws_fyers)
+
         if token_sheet:
-            st.success("Token found in Google Sheet ✅")
+            st.success("Token found ✅")
         else:
-            st.warning("No access token in sheet yet ❗")
+            st.warning("No token yet ❗")
 
         if updated_at_sheet:
             st.caption(f"Last updated: {updated_at_sheet}")
 
     st.markdown("---")
-    st.subheader("🔑 Generate / Update FYERS Access Token")
-    redirect_uri = st.secrets.get("FYERS_REDIRECT_URI", "https://trade.fyers.in/api-login/redirect-uri/index.html")
+    with st.expander("🔑 Generate / Update Token", expanded=False):
+        redirect_uri = st.secrets.get("FYERS_REDIRECT_URI", "https://trade.fyers.in/api-login/redirect-uri/index.html")
 
-    if not ws_fyers_err and ws_fyers and app_id_sheet and secret_id_sheet:
-        try:
-            login_url = build_fyers_login_url(app_id_sheet, secret_id_sheet, redirect_uri)
-            st.link_button("1) Open FYERS Login", login_url)
-            st.caption("After login, copy `auth_code` from redirected URL and paste below.")
-        except Exception as e:
-            st.error(f"Could not generate login URL: {e}")
-            login_url = None
+        if not app_id_sheet or not secret_id_sheet:
+            st.error("Missing fyers_app_id / fyers_secret_id in the FYERS token sheet (row 2).")
+        else:
+            try:
+                login_url = build_fyers_login_url(app_id_sheet, secret_id_sheet, redirect_uri)
+                st.link_button("1) Open FYERS Login", login_url)
+                st.caption("After login, copy `auth_code` from redirected URL and paste below.")
+            except Exception as e:
+                st.error(f"Could not generate login URL: {e}")
+                login_url = None
 
-        auth_code = st.text_input("2) Paste auth_code here", value="", help="From redirected URL after FYERS login.")
+            auth_code = st.text_input("2) Paste auth_code", value="", help="From redirected URL after FYERS login.")
 
-        if st.button("3) Exchange & Save Token", type="primary"):
-            if not auth_code.strip():
-                st.error("Please paste the auth_code first.")
-            else:
-                try:
-                    token = exchange_auth_code_for_token(app_id_sheet, secret_id_sheet, redirect_uri, auth_code.strip())
-                    ts = now_ist_naive().strftime("%Y-%m-%d %H:%M:%S")
-                    update_fyers_token(ws_fyers, token, ts)
-                    st.success("Saved access token + timestamp to the FYERS sheet ✅")
-                    st.cache_data.clear()
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Token exchange failed: {e}")
-    else:
-        st.info("Add fyers_app_id + fyers_secret_id in FYERS token sheet row 2 to enable login flow.")
+            if st.button("3) Exchange & Save Token", type="primary"):
+                if not auth_code.strip():
+                    st.error("Please paste auth_code first.")
+                else:
+                    try:
+                        token = exchange_auth_code_for_token(app_id_sheet, secret_id_sheet, redirect_uri, auth_code.strip())
+                        ts = now_ist().strftime("%Y-%m-%d %H:%M:%S")
+                        update_fyers_token(ws_fyers, token, ts)
+                        st.success("Saved access token ✅")
+                        st.cache_data.clear()
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Token exchange failed: {e}")
 
-# -------------------- FYERS INIT --------------------
+
+# -------------------- FYERS INIT (non-blocking) --------------------
 fyers_ok = False
 fyers_health_ok = False
 fyers_health_msg = "Not checked"
@@ -519,11 +506,13 @@ if token_sheet and app_id_sheet:
 else:
     fyers_ok = False
     fyers_health_ok = False
-    fyers_health_msg = "No token yet. Use the login panel above."
+    fyers_health_msg = "No token (scan disabled)."
 
-# -------------------- Main UI Header --------------------
-st.title("📉 Trend Squeeze Screener (15M + Daily) - Market Aware")
-n = now_ist_aware()
+
+# -------------------- Header --------------------
+st.title("📉 Trend Squeeze Screener (15M + Daily) — Market Aware")
+
+n = now_ist()
 mode_str = "🟢 LIVE MARKET" if market_open_now() else "🔵 OFF-MARKET"
 st.caption(f"{mode_str} • Last refresh: {n.strftime('%d %b %Y • %H:%M:%S')} IST")
 
@@ -531,418 +520,487 @@ last_trading_day = get_last_trading_day(n.date())
 st.caption(f"🗓️ Last trading day: {last_trading_day.strftime('%d %b %Y')}")
 
 if fyers_ok and fyers_health_ok:
-    st.success("✅ FYERS data fetch OK")
+    st.success("✅ FYERS OK")
 elif fyers_ok and not fyers_health_ok:
-    st.warning(f"⚠️ FYERS session set but data fetch failing: {fyers_health_msg}")
+    st.warning(f"⚠️ FYERS session set, but fetch failing: {fyers_health_msg}")
 else:
-    st.error("🔴 FYERS not initialized (no valid token). Use the sidebar login flow.")
-    st.stop()
+    st.warning("⚠️ FYERS not ready (token missing/invalid). You can still view previously logged signals.")
 
-fallback_nifty50 = [
-    "ADANIENT","ADANIPORTS","APOLLOHOSP","ASIANPAINT","AXISBANK","BAJAJ-AUTO","BAJFINANCE","BAJAJFINSV",
-    "BHARTIARTL","BPCL","BRITANNIA","CIPLA","COALINDIA","DIVISLAB","DRREDDY","EICHERMOT","GRASIM","HCLTECH",
-    "HDFCBANK","HINDALCO","HINDUNILVR","ICICIBANK","INDUSINDBK","INFY","ITC","JSWSTEEL","KOTAKBANK","LT","LTIM",
-    "M&M","MARUTI","NESTLEIND","NTPC","ONGC","POWERGRID","RELIANCE","SBIN","SBILIFE","SUNPHARMA","TATACONSUM",
-    "TMPV","TATASTEEL","TCS","TECHM","TITAN","ULTRACEMCO","UPL","WIPRO","HEROMOTOCO","SHREECEM"
-]
-stock_list = fallback_nifty50
 st.caption(f"Universe: NIFTY50 ({len(stock_list)} symbols).")
 
-live_tab, backtest_tab = st.tabs(["📺 Live Screener (15M + Daily)", "📜 Backtest"])
 
-# ---------- Signature detection ----------
-_STRAT_SIG = inspect.signature(prepare_trend_squeeze)
-_HAS_ENGINE = "engine" in _STRAT_SIG.parameters
-_HAS_BOX_WIDTH = "box_width_pct_max" in _STRAT_SIG.parameters
-_HAS_RSI_FLOOR = "rsi_floor_short" in _STRAT_SIG.parameters
-_HAS_DI = "require_di_confirmation" in _STRAT_SIG.parameters
+# -------------------- Tabs: Signals, Settings, Backtest --------------------
+tab_signals, tab_settings, tab_backtest = st.tabs(["📌 Signals (Now)", "🛠 Settings", "📜 Backtest"])
 
-with live_tab:
-    st.subheader("📺 Live Screener (15M + Daily • Market-Aware)")
 
-    with st.sidebar:
-        st.markdown("---")
-        st.subheader("⚙️ Screener Settings")
+# -------------------- Settings (stored in session state) --------------------
+def ss_init(key, default):
+    if key not in st.session_state:
+        st.session_state[key] = default
 
-        show_debug = st.checkbox("Show debug messages", value=False)
+# Defaults
+ss_init("show_debug", False)
+ss_init("audit_mode", False)
+ss_init("retention_hours", 24)
+ss_init("catchup_candles_15m", 32)
 
-        audit_mode = st.checkbox(
-            "Audit mode (show all signals, no de-dup)",
-            value=False,
-            help="Useful to verify whether the app logged something but UI hid it due to de-dup."
+ss_init("auto_scan_market_hours", True)
+ss_init("scan_parallel", True)
+ss_init("parallel_workers", 6)
+
+ss_init("signal_mode", "✅ Breakout Confirmed (trade)")
+ss_init("breakout_lookback", 20)
+ss_init("require_bbw_expansion", True)
+ss_init("require_volume_spike", False)
+ss_init("volume_spike_mult", 1.5)
+
+ss_init("param_profile", "Normal")
+
+# Engine defaults
+ss_init("engine_ui", "Hybrid (recommended)")
+ss_init("box_width_pct_max", 1.2)  # percent
+ss_init("require_di_confirmation", True)
+ss_init("adx_use_as_filter", False)
+
+ss_init("rsi_floor_short", 30.0)
+ss_init("rsi_ceiling_long", 70.0)
+
+# Filter defaults
+ss_init("quality_main", ["A"])
+ss_init("bias_filter", "All")
+ss_init("symbol_search", "")
+
+
+with tab_settings:
+    st.subheader("🛠 Settings (hidden from Signals tab)")
+
+    cA, cB, cC = st.columns(3)
+    with cA:
+        st.session_state.show_debug = st.checkbox("Show debug messages", value=st.session_state.show_debug)
+        st.session_state.audit_mode = st.checkbox(
+            "Audit mode (show all signals, no de-dup in UI)",
+            value=st.session_state.audit_mode,
+            help="Shows all signals instead of keeping only latest per symbol/timeframe.",
         )
-
-        st.markdown("---")
-        st.subheader("📊 Live coherence")
-        catchup_candles_15m = st.slider("15M Catch-up window (candles)", 8, 64, 32, 4)
-        retention_hours = st.slider("Base retention (calendar hours)", 6, 48, 24, 6)
-
-        st.markdown("---")
-        st.subheader("🧨 Breakout confirmation")
-        signal_mode = st.radio(
-            "Signal type",
-            ["✅ Breakout Confirmed (trade)", "🟡 Setup Forming (watchlist)"],
-            index=0
+    with cB:
+        st.session_state.auto_scan_market_hours = st.checkbox(
+            "Auto-scan during market hours",
+            value=st.session_state.auto_scan_market_hours,
+            help="If OFF, app will only show logged signals and scan only when you click Scan Now.",
         )
-        breakout_lookback = st.slider("Consolidation range lookback (candles)", 10, 60, 20, 5)
-        require_bbw_expansion = st.checkbox("Require BBW expansion on breakout", value=True)
-        require_volume_spike = st.checkbox("Require volume spike (if volume is available)", value=False)
-        volume_spike_mult = st.slider("Volume spike multiplier (vs 20 SMA)", 1.0, 3.0, 1.5, 0.1)
+        st.session_state.retention_hours = st.slider("Retention (base calendar hours)", 6, 72, st.session_state.retention_hours, 6)
+    with cC:
+        st.session_state.catchup_candles_15m = st.slider("15M Catch-up window (candles)", 8, 96, st.session_state.catchup_candles_15m, 4)
 
-        st.markdown("---")
-        st.subheader("🧩 Engine (optional upgrade)")
-        if _HAS_ENGINE:
-            engine_ui = st.selectbox(
-                "Detection engine",
-                ["Hybrid (recommended)", "Box Breakout (range)", "Squeeze Breakout (TTM)"],
-                index=0
-            )
-            if engine_ui.startswith("Box"):
-                engine_arg = "box"
-            elif engine_ui.startswith("Squeeze"):
-                engine_arg = "squeeze"
-            else:
-                engine_arg = "hybrid"
-        else:
-            engine_arg = None
-            st.info("Your strategy.py does not support Engine controls. (App will still work.)")
+    st.markdown("---")
+    st.subheader("🧨 Signal type + confirmation")
+    st.session_state.signal_mode = st.radio(
+        "Signal type",
+        ["✅ Breakout Confirmed (trade)", "🟡 Setup Forming (watchlist)"],
+        index=0 if st.session_state.signal_mode.startswith("✅") else 1,
+        horizontal=True
+    )
 
-        if _HAS_BOX_WIDTH:
-            box_width_pct_max = st.slider("Max box width (%)", 0.3, 3.0, 1.2, 0.1) / 100.0
-        else:
-            box_width_pct_max = None
-
-        if _HAS_DI:
-            require_di_confirmation = st.checkbox("Require DI confirmation (+DI/-DI)", value=True)
-        else:
-            require_di_confirmation = None
-
-        if _HAS_RSI_FLOOR:
-            st.markdown("---")
-            st.subheader("🚫 Anti-chase filters")
-            rsi_floor_short = st.slider("Block SHORT if RSI below", 10.0, 45.0, 30.0, 1.0)
-            rsi_ceiling_long = st.slider("Block LONG if RSI above", 55.0, 90.0, 70.0, 1.0)
-        else:
-            rsi_floor_short = None
-            rsi_ceiling_long = None
-
-        st.markdown("---")
-        param_profile = st.selectbox("Parameter Profile", ["Normal", "Conservative", "Aggressive"])
-
-    if param_profile == "Conservative":
-        bbw_abs_default, bbw_pct_default = 0.035, 0.25
-        adx_default, rsi_bull_default, rsi_bear_default = 25.0, 60.0, 40.0
-    elif param_profile == "Aggressive":
-        bbw_abs_default, bbw_pct_default = 0.065, 0.45
-        adx_default, rsi_bull_default, rsi_bear_default = 18.0, 52.0, 48.0
-    else:
-        bbw_abs_default, bbw_pct_default = 0.05, 0.35
-        adx_default, rsi_bull_default, rsi_bear_default = 20.0, 55.0, 45.0
-
-    c1, c2 = st.columns(2)
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
-        bbw_abs_threshold = st.slider("BBW absolute threshold (max BBW)", 0.01, 0.20, bbw_abs_default, 0.005)
+        st.session_state.breakout_lookback = st.slider("Range lookback (candles)", 10, 60, st.session_state.breakout_lookback, 5)
     with c2:
-        bbw_pct_threshold = st.slider("BBW percentile threshold", 0.10, 0.80, bbw_pct_default, 0.05)
-
-    c3, c4, c5 = st.columns(3)
+        st.session_state.require_bbw_expansion = st.checkbox("Require BBW expansion", value=st.session_state.require_bbw_expansion)
     with c3:
-        adx_threshold = st.slider("ADX threshold", 15.0, 35.0, adx_default, 1.0)
+        st.session_state.require_volume_spike = st.checkbox("Require volume spike", value=st.session_state.require_volume_spike)
     with c4:
-        rsi_bull = st.slider("RSI bull threshold", 50.0, 70.0, rsi_bull_default, 1.0)
-    with c5:
-        rsi_bear = st.slider("RSI bear threshold", 30.0, 50.0, rsi_bear_default, 1.0)
+        st.session_state.volume_spike_mult = st.slider("Volume spike mult (vs 20 SMA)", 1.0, 3.0, st.session_state.volume_spike_mult, 0.1)
 
-    params_hash = params_to_hash(bbw_abs_threshold, bbw_pct_threshold, adx_threshold, rsi_bull, rsi_bear)
-    use_setup_col = "setup" if signal_mode.startswith("✅") else "setup_forming"
+    st.markdown("---")
+    st.subheader("🧩 Engine")
+    if _HAS_ENGINE:
+        st.session_state.engine_ui = st.selectbox(
+            "Detection engine",
+            ["Hybrid (recommended)", "Box Breakout (range)", "Squeeze Breakout (TTM)"],
+            index=["Hybrid (recommended)", "Box Breakout (range)", "Squeeze Breakout (TTM)"].index(st.session_state.engine_ui)
+        )
+    else:
+        st.info("Your strategy.py does not support engine parameter. (App still works.)")
 
-    smart_retention_15m = get_market_aware_window(retention_hours)
+    if _HAS_BOX_WIDTH:
+        st.session_state.box_width_pct_max = st.slider("Max box width (%)", 0.3, 3.0, st.session_state.box_width_pct_max, 0.1)
+    if _HAS_DI:
+        st.session_state.require_di_confirmation = st.checkbox("Require DI confirmation (+DI/-DI)", value=st.session_state.require_di_confirmation)
+    if _HAS_ADX_USE_FILTER:
+        st.session_state.adx_use_as_filter = st.checkbox("Use ADX as filter in Box engine", value=st.session_state.adx_use_as_filter)
+
+    if _HAS_RSI_FLOOR:
+        st.markdown("---")
+        st.subheader("🚫 Anti-chase filters")
+        st.session_state.rsi_floor_short = st.slider("Block SHORT if RSI below", 10.0, 45.0, st.session_state.rsi_floor_short, 1.0)
+        st.session_state.rsi_ceiling_long = st.slider("Block LONG if RSI above", 55.0, 90.0, st.session_state.rsi_ceiling_long, 1.0)
+
+    st.markdown("---")
+    st.subheader("⚡ Performance")
+    st.session_state.scan_parallel = st.checkbox("Parallel scan (faster)", value=st.session_state.scan_parallel)
+    if st.session_state.scan_parallel:
+        st.session_state.parallel_workers = st.slider("Parallel workers", 2, 10, st.session_state.parallel_workers, 1)
+    st.caption("Tip: FYERS may rate-limit if you go too high. 6 is a sane default.")
+
+    st.markdown("---")
+    st.subheader("🧪 Parameter Profile (quick presets)")
+    st.session_state.param_profile = st.selectbox("Profile", ["Normal", "Conservative", "Aggressive"],
+                                                  index=["Normal", "Conservative", "Aggressive"].index(st.session_state.param_profile))
+
+
+# -------------------- Parameter profile -> thresholds --------------------
+def get_profile_thresholds(profile: str):
+    if profile == "Conservative":
+        return 0.035, 0.25, 25.0, 60.0, 40.0
+    if profile == "Aggressive":
+        return 0.065, 0.45, 18.0, 52.0, 48.0
+    return 0.05, 0.35, 20.0, 55.0, 45.0
+
+
+# -------------------- Scan core --------------------
+def build_engine_arg(engine_ui: str) -> str | None:
+    if not _HAS_ENGINE:
+        return None
+    if engine_ui.startswith("Box"):
+        return "box"
+    if engine_ui.startswith("Squeeze"):
+        return "squeeze"
+    return "hybrid"
+
+def make_kwargs(bbw_abs_threshold, bbw_pct_threshold, adx_threshold, rsi_bull, rsi_bear):
+    kwargs = dict(
+        bbw_abs_threshold=bbw_abs_threshold,
+        bbw_pct_threshold=bbw_pct_threshold,
+        adx_threshold=adx_threshold,
+        rsi_bull=rsi_bull,
+        rsi_bear=rsi_bear,
+        rolling_window=20,
+        breakout_lookback=int(st.session_state.breakout_lookback),
+        require_bbw_expansion=bool(st.session_state.require_bbw_expansion),
+        require_volume_spike=bool(st.session_state.require_volume_spike),
+        volume_spike_mult=float(st.session_state.volume_spike_mult),
+    )
+    eng = build_engine_arg(st.session_state.engine_ui)
+    if eng is not None:
+        kwargs["engine"] = eng
+    if _HAS_BOX_WIDTH:
+        kwargs["box_width_pct_max"] = float(st.session_state.box_width_pct_max) / 100.0
+    if _HAS_DI:
+        kwargs["require_di_confirmation"] = bool(st.session_state.require_di_confirmation)
+    if _HAS_ADX_USE_FILTER:
+        kwargs["adx_use_as_filter"] = bool(st.session_state.adx_use_as_filter)
+    if _HAS_RSI_FLOOR:
+        kwargs["rsi_floor_short"] = float(st.session_state.rsi_floor_short)
+        kwargs["rsi_ceiling_long"] = float(st.session_state.rsi_ceiling_long)
+    return kwargs
+
+def scan_symbol_15m(symbol: str, use_setup_col: str, catchup_candles: int, existing_keys: set, params_hash: str):
+    rows = []
+    try:
+        df = get_ohlc_15min(symbol, days_back=15)
+        if df is None or df.shape[0] < 220:
+            return rows, None
+
+        bbw_abs, bbw_pct, adx_thr, rsi_bull, rsi_bear = get_profile_thresholds(st.session_state.param_profile)
+        kwargs = make_kwargs(bbw_abs, bbw_pct, adx_thr, rsi_bull, rsi_bear)
+
+        df_prepped = prepare_trend_squeeze(df, **kwargs)
+
+        recent = df_prepped.tail(int(catchup_candles)).copy()
+        recent = recent[recent[use_setup_col] != ""]
+
+        logged_at = fmt_dt(now_ist())
+
+        for candle_ts, r in recent.iterrows():
+            ts_ist = to_ist_naive(candle_ts).floor("15min")
+            signal_time = ts_ist.strftime("%Y-%m-%d %H:%M")
+            setup = r[use_setup_col]
+            trend = r.get("trend", "")
+            ltp = float(r.get("close", np.nan))
+            bbw = float(r.get("bbw", np.nan))
+            bbw_rank = r.get("bbw_pct_rank", np.nan)
+            rsi_val = float(r.get("rsi", np.nan))
+            adx_val = float(r.get("adx", np.nan))
+
+            bias = "LONG" if str(setup).startswith("Bullish") else "SHORT"
+            key = f"{symbol}|15M|Continuation|{signal_time}|{setup}|{bias}"
+
+            if key not in existing_keys:
+                quality = compute_quality_score(r)
+                rows.append([
+                    key, signal_time, logged_at, symbol, "15M", "Continuation",
+                    setup, bias, ltp, bbw, bbw_rank, rsi_val, adx_val, trend,
+                    quality, params_hash
+                ])
+                existing_keys.add(key)
+
+        return rows, None
+    except Exception as e:
+        return rows, str(e)
+
+def scan_symbol_daily(symbol: str, use_setup_col: str, existing_keys: set, params_hash: str):
+    rows = []
+    try:
+        df_daily = get_ohlc_daily(symbol, lookback_days=252)
+        if df_daily is None or df_daily.shape[0] < 100:
+            return rows, None
+
+        bbw_abs, bbw_pct, adx_thr, rsi_bull, rsi_bear = get_profile_thresholds(st.session_state.param_profile)
+        # Slightly relaxed BBW abs for daily
+        kwargs = make_kwargs(bbw_abs * 1.2, bbw_pct, adx_thr, rsi_bull, rsi_bear)
+
+        df_prepped = prepare_trend_squeeze(df_daily, **kwargs)
+
+        recent = df_prepped.tail(7).copy()
+        recent = recent[recent[use_setup_col] != ""]
+
+        logged_at = fmt_dt(now_ist())
+
+        for candle_ts, r in recent.iterrows():
+            ts_ist = to_ist_naive(candle_ts).floor("1D")
+            signal_time = ts_ist.strftime("%Y-%m-%d")
+            setup = r[use_setup_col]
+            trend = r.get("trend", "")
+            ltp = float(r.get("close", np.nan))
+            bbw = float(r.get("bbw", np.nan))
+            bbw_rank = r.get("bbw_pct_rank", np.nan)
+            rsi_val = float(r.get("rsi", np.nan))
+            adx_val = float(r.get("adx", np.nan))
+
+            bias = "LONG" if str(setup).startswith("Bullish") else "SHORT"
+            key = f"{symbol}|Daily|Continuation|{signal_time}|{setup}|{bias}"
+
+            if key not in existing_keys:
+                quality = compute_quality_score(r)
+                rows.append([
+                    key, signal_time, logged_at, symbol, "Daily", "Continuation",
+                    setup, bias, ltp, bbw, bbw_rank, rsi_val, adx_val, trend,
+                    quality, params_hash
+                ])
+                existing_keys.add(key)
+
+        return rows, None
+    except Exception as e:
+        return rows, str(e)
+
+
+# -------------------- SIGNALS TAB: show signals FIRST --------------------
+with tab_signals:
+    st.subheader("🧠 Recent Signals (Market-Aware)")
+
+    # Minimal filters row (trader-friendly)
+    f1, f2, f3, f4 = st.columns([1.2, 1.0, 1.2, 1.6])
+    with f1:
+        quality_main = st.multiselect("Quality", ["A", "B", "C"], default=st.session_state.quality_main)
+        st.session_state.quality_main = quality_main or ["A"]
+    with f2:
+        bias_filter = st.selectbox("Bias", ["All", "LONG", "SHORT"], index=["All", "LONG", "SHORT"].index(st.session_state.bias_filter))
+        st.session_state.bias_filter = bias_filter
+    with f3:
+        mode_filter = st.selectbox("Mode", ["All", "Breakouts", "Forming"], index=0)
+    with f4:
+        symbol_search = st.text_input("Search symbol", value=st.session_state.symbol_search, placeholder="e.g. SBIN")
+        st.session_state.symbol_search = symbol_search
+
+    # Sheet load
+    ws_15m, ws_15m_err = get_signals_worksheet(SIGNAL_SHEET_15M)
+    ws_daily, ws_daily_err = get_signals_worksheet(SIGNAL_SHEET_DAILY)
+
+    # FIXED: no inline ternary that returns DeltaGenerator (your “weird output” bug)
+    if ws_15m_err:
+        st.error(f"15M Sheet ❌: {ws_15m_err}")
+    else:
+        st.success("15M Sheet ✅")
+
+    if ws_daily_err:
+        st.error(f"Daily Sheet ❌: {ws_daily_err}")
+    else:
+        st.success("Daily Sheet ✅")
+
+    retention_hours = int(st.session_state.retention_hours)
+    smart_retention_15m = get_market_aware_window(retention_hours, "15M")
     smart_retention_daily = get_market_aware_window(retention_hours, "Daily")
-    st.caption(f"🧠 Showing last ~{smart_retention_15m}h trading time (15M) | ~{smart_retention_daily/24:.0f} trading days (Daily)")
+    st.caption(f"Showing ~{smart_retention_15m}h trading-time (15M) | ~{smart_retention_daily/24:.0f} trading-days (Daily)")
 
-    # --- Sheets status (FIXED: no ternary Streamlit calls) ---
-    col1_15m, col2_daily = st.columns(2)
+    df_15m = pd.DataFrame() if (not ws_15m or ws_15m_err) else load_recent_signals(ws_15m, retention_hours, "15M")
+    df_daily = pd.DataFrame() if (not ws_daily or ws_daily_err) else load_recent_signals(ws_daily, retention_hours, "Daily")
 
-    with col1_15m:
-        ws_15m, ws_15m_err = get_signals_worksheet(SIGNAL_SHEET_15M)
-        if ws_15m_err:
-            st.error(f"15M Sheets ❌: {ws_15m_err}")
+    # Apply UI filters
+    def apply_filters(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df
+
+        out = df.copy()
+
+        # Quality filter
+        out = out[out["Quality"].isin(st.session_state.quality_main)]
+
+        # Bias filter
+        if st.session_state.bias_filter != "All":
+            out = out[out["Bias"] == st.session_state.bias_filter]
+
+        # Mode filter (rough): based on Setup label
+        if mode_filter == "Breakouts":
+            out = out[out["Setup"].str.contains("Breakout", na=False)]
+        elif mode_filter == "Forming":
+            out = out[~out["Setup"].str.contains("Breakout", na=False)]
+
+        # Symbol search
+        q = (st.session_state.symbol_search or "").strip().upper()
+        if q:
+            out = out[out["Symbol"].astype(str).str.upper().str.contains(q, na=False)]
+
+        # Quality-first sorting
+        order = {"A": 0, "B": 1, "C": 2}
+        out["_q"] = out["Quality"].map(order).fillna(9)
+        out = out.sort_values(["_q", "Timestamp"], ascending=[True, False]).drop(columns=["_q"])
+        return out
+
+    df_15m_f = apply_filters(df_15m)
+    df_daily_f = apply_filters(df_daily)
+
+    # Summary metrics row
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("15M Signals", 0 if df_15m_f.empty else len(df_15m_f))
+    m2.metric("Daily Signals", 0 if df_daily_f.empty else len(df_daily_f))
+
+    newest = ""
+    if not df_15m_f.empty:
+        newest = df_15m_f.iloc[0]["Timestamp"]
+    if not newest and not df_daily_f.empty:
+        newest = df_daily_f.iloc[0]["Timestamp"]
+    m3.metric("Newest", newest or "—")
+    m4.metric("Market", "LIVE" if market_open_now() else "OFF")
+
+    # Tables (15M left, Daily right)
+    left, right = st.columns(2)
+
+    with left:
+        st.markdown("### 15M Signals")
+        if df_15m_f.empty:
+            st.info("No matching 15M signals in this window.")
         else:
-            st.success("15M Sheets ✅")
-
-    with col2_daily:
-        ws_daily, ws_daily_err = get_signals_worksheet(SIGNAL_SHEET_DAILY)
-        if ws_daily_err:
-            st.error(f"Daily Sheets ❌: {ws_daily_err}")
-        else:
-            st.success("Daily Sheets ✅")
-
-    existing_keys_15m = fetch_existing_keys_recent(ws_15m, days_back=3) if ws_15m and not ws_15m_err else set()
-    existing_keys_daily = fetch_existing_keys_recent(ws_daily, days_back=14) if ws_daily and not ws_daily_err else set()
-
-    rows_15m, rows_daily = [], []
-    logged_at = fmt_dt(now_ist_naive())
-
-    # ----------- scan stats -----------
-    stats = {
-        "15m_scanned": 0,
-        "15m_skipped_short": 0,
-        "15m_errors": 0,
-        "daily_scanned": 0,
-        "daily_skipped_short": 0,
-        "daily_errors": 0,
-        "daily_throttled": False,
-    }
-
-    # -------------------- 15M scan (always) --------------------
-    prog = st.progress(0, text="Scanning 15M…")
-    for i, symbol in enumerate(stock_list):
-        stats["15m_scanned"] += 1
-        prog.progress(int((i + 1) / len(stock_list) * 100), text=f"Scanning 15M… {symbol}")
-
-        try:
-            df = ohlc_15m_cached(symbol, days_back=15)
-            if df is None or df.shape[0] < 220:
-                stats["15m_skipped_short"] += 1
-                continue
-
-            kwargs = dict(
-                bbw_abs_threshold=bbw_abs_threshold,
-                bbw_pct_threshold=bbw_pct_threshold,
-                adx_threshold=adx_threshold,
-                rsi_bull=rsi_bull,
-                rsi_bear=rsi_bear,
-                rolling_window=20,
-                breakout_lookback=breakout_lookback,
-                require_bbw_expansion=require_bbw_expansion,
-                require_volume_spike=require_volume_spike,
-                volume_spike_mult=volume_spike_mult,
+            st.dataframe(df_15m_f, use_container_width=True)
+            st.download_button(
+                "⬇️ Download 15M CSV",
+                df_15m_f.to_csv(index=False).encode("utf-8"),
+                file_name="trend_squeeze_15m_signals.csv",
+                mime="text/csv"
             )
 
-            if _HAS_ENGINE and engine_arg is not None:
-                kwargs["engine"] = engine_arg
-            if _HAS_BOX_WIDTH and box_width_pct_max is not None:
-                kwargs["box_width_pct_max"] = box_width_pct_max
-            if _HAS_DI and require_di_confirmation is not None:
-                kwargs["require_di_confirmation"] = require_di_confirmation
-            if _HAS_RSI_FLOOR and rsi_floor_short is not None and rsi_ceiling_long is not None:
-                kwargs["rsi_floor_short"] = rsi_floor_short
-                kwargs["rsi_ceiling_long"] = rsi_ceiling_long
-
-            df_prepped = prepare_trend_squeeze(df, **kwargs)
-
-            recent = df_prepped.tail(int(catchup_candles_15m)).copy()
-            recent = recent[recent[use_setup_col] != ""]
-
-            for candle_ts, r in recent.iterrows():
-                # candles already IST-naive
-                signal_time = pd.Timestamp(candle_ts).floor("15min").strftime("%Y-%m-%d %H:%M")
-                setup = r[use_setup_col]
-                trend = r.get("trend", "")
-                ltp = float(r.get("close", np.nan))
-                bbw = float(r.get("bbw", np.nan))
-                bbw_rank = r.get("bbw_pct_rank", np.nan)
-                rsi_val = float(r.get("rsi", np.nan))
-                adx_val = float(r.get("adx", np.nan))
-
-                bias = "LONG" if str(setup).startswith("Bullish") else "SHORT"
-
-                # keep key stable per candle+setup+bias (parameter changes go into params_hash column)
-                key = f"{symbol}|15M|Continuation|{signal_time}|{setup}|{bias}"
-
-                if key not in existing_keys_15m:
-                    quality = compute_quality_score(r)
-                    rows_15m.append([
-                        key, signal_time, logged_at, symbol, "15M", "Continuation",
-                        setup, bias, ltp, bbw, bbw_rank, rsi_val, adx_val, trend,
-                        quality, params_hash
-                    ])
-                    existing_keys_15m.add(key)
-
-        except Exception as e:
-            stats["15m_errors"] += 1
-            if show_debug:
-                st.warning(f"{symbol} 15M error: {e}")
-            continue
-
-    prog.empty()
-
-    # -------------------- Daily scan (ALL 50) with throttle --------------------
-    # Improvement: avoid re-running heavy Daily compute every 5 minutes.
-    # We still INCLUDE all 50, but we compute at most once per hour (unless first run).
-    throttle_minutes = 60
-    last_daily_run = st.session_state.get("last_daily_scan_ts", None)
-    now_naive = now_ist_naive()
-
-    should_run_daily = True
-    if last_daily_run is not None:
-        if isinstance(last_daily_run, str):
-            last_daily_run = pd.to_datetime(last_daily_run)
-        if now_naive - last_daily_run < timedelta(minutes=throttle_minutes):
-            should_run_daily = False
-
-    if not should_run_daily:
-        stats["daily_throttled"] = True
-    else:
-        st.session_state["last_daily_scan_ts"] = now_naive
-
-        lookback_days_daily = 252
-        prog2 = st.progress(0, text="Scanning Daily…")
-        for i, symbol in enumerate(stock_list):  # ✅ all 50
-            stats["daily_scanned"] += 1
-            prog2.progress(int((i + 1) / len(stock_list) * 100), text=f"Scanning Daily… {symbol}")
-
-            try:
-                df_daily = ohlc_daily_cached(symbol, lookback_days=lookback_days_daily)
-                if df_daily is None or df_daily.shape[0] < 100:
-                    stats["daily_skipped_short"] += 1
-                    continue
-
-                kwargs = dict(
-                    bbw_abs_threshold=bbw_abs_threshold * 1.2,
-                    bbw_pct_threshold=bbw_pct_threshold,
-                    adx_threshold=adx_threshold,
-                    rsi_bull=rsi_bull,
-                    rsi_bear=rsi_bear,
-                    rolling_window=20,
-                    breakout_lookback=breakout_lookback,
-                    require_bbw_expansion=require_bbw_expansion,
-                    require_volume_spike=require_volume_spike,
-                    volume_spike_mult=volume_spike_mult,
-                )
-
-                if _HAS_ENGINE and engine_arg is not None:
-                    kwargs["engine"] = engine_arg
-                if _HAS_BOX_WIDTH and box_width_pct_max is not None:
-                    kwargs["box_width_pct_max"] = box_width_pct_max
-                if _HAS_DI and require_di_confirmation is not None:
-                    kwargs["require_di_confirmation"] = require_di_confirmation
-                if _HAS_RSI_FLOOR and rsi_floor_short is not None and rsi_ceiling_long is not None:
-                    kwargs["rsi_floor_short"] = rsi_floor_short
-                    kwargs["rsi_ceiling_long"] = rsi_ceiling_long
-
-                df_daily_prepped = prepare_trend_squeeze(df_daily, **kwargs)
-
-                recent_daily = df_daily_prepped.tail(5).copy()
-                recent_daily = recent_daily[recent_daily[use_setup_col] != ""]
-
-                for candle_ts, r in recent_daily.iterrows():
-                    signal_time = pd.Timestamp(candle_ts).floor("1D").strftime("%Y-%m-%d")
-                    setup = r[use_setup_col]
-                    trend = r.get("trend", "")
-                    ltp = float(r.get("close", np.nan))
-                    bbw = float(r.get("bbw", np.nan))
-                    bbw_rank = r.get("bbw_pct_rank", np.nan)
-                    rsi_val = float(r.get("rsi", np.nan))
-                    adx_val = float(r.get("adx", np.nan))
-
-                    bias = "LONG" if str(setup).startswith("Bullish") else "SHORT"
-                    key = f"{symbol}|Daily|Continuation|{signal_time}|{setup}|{bias}"
-
-                    if key not in existing_keys_daily:
-                        quality = compute_quality_score(r)
-                        rows_daily.append([
-                            key, signal_time, logged_at, symbol, "Daily", "Continuation",
-                            setup, bias, ltp, bbw, bbw_rank, rsi_val, adx_val, trend,
-                            quality, params_hash
-                        ])
-                        existing_keys_daily.add(key)
-
-            except Exception as e:
-                stats["daily_errors"] += 1
-                if show_debug:
-                    st.warning(f"{symbol} Daily error: {e}")
-                continue
-
-        prog2.empty()
-
-    # -------------------- Write to sheets --------------------
-    appended_15m = appended_daily = 0
-    if ws_15m and not ws_15m_err:
-        appended_15m, _ = append_signals(ws_15m, rows_15m, show_debug)
-    if ws_daily and not ws_daily_err and not stats["daily_throttled"]:
-        appended_daily, _ = append_signals(ws_daily, rows_daily, show_debug)
-
-    # -------------------- Scan stats panel --------------------
-    with st.expander("🧾 Scan Health (what actually happened)", expanded=False):
-        cA, cB, cC = st.columns(3)
-        cA.metric("15M scanned", stats["15m_scanned"])
-        cB.metric("15M skipped (short data)", stats["15m_skipped_short"])
-        cC.metric("15M errors", stats["15m_errors"])
-
-        cD, cE, cF = st.columns(3)
-        cD.metric("Daily scanned", stats["daily_scanned"])
-        cE.metric("Daily skipped (short data)", stats["daily_skipped_short"])
-        cF.metric("Daily errors", stats["daily_errors"])
-
-        if stats["daily_throttled"]:
-            st.info("Daily scan throttled (runs at most once per hour). This is intentional to avoid heavy re-compute every 5 minutes.")
-
-    st.caption(f"Logged **{appended_15m}** new 15M + **{appended_daily}** Daily signals.")
-
-    # -------------------- Display recent signals --------------------
-    df_recent_15m = pd.DataFrame() if not ws_15m else load_recent_signals(ws_15m, retention_hours, "15M", audit_mode=audit_mode)
-    df_recent_daily = pd.DataFrame() if not ws_daily else load_recent_signals(ws_daily, retention_hours, "Daily", audit_mode=audit_mode)
-
-def _quality_filter_ui(df: pd.DataFrame, label: str) -> pd.DataFrame:
-    """
-    Default: show only Quality A.
-    B/C are hidden behind an expander + multiselect.
-    """
-    if df.empty or "Quality" not in df.columns:
-        return df
-
-    # Default view
-    default_qualities = ["A"]
-
-    with st.expander(f"🔎 {label}: show/hide Quality levels", expanded=False):
-        qualities = ["A", "B", "C"]
-        show_q = st.multiselect(
-            "Show qualities",
-            options=qualities,
-            default=default_qualities,
-            help="Default is only A. Add B/C if you want more (and noisier) signals."
-        )
-
-        # Optional: quick toggle
-        show_all = st.checkbox("Show all qualities (A+B+C)", value=False)
-        if show_all:
-            show_q = qualities
-
-    # Apply filter (if user unselects everything, show nothing)
-    return df[df["Quality"].isin(show_q)].copy()
-
-
-if not df_recent_15m.empty or not df_recent_daily.empty:
-    st.markdown("### 🧠 Recent Signals (Market-Aware)")
-
-    # ---- 15M ----
-    if not df_recent_15m.empty:
-        st.subheader("15M Signals")
-        df_15m_filtered = _quality_filter_ui(df_recent_15m, "15M Signals")
-        if not df_15m_filtered.empty:
-            # A-first ordering (and then newest first)
-            df_15m_filtered["__q_rank"] = df_15m_filtered["Quality"].map({"A": 0, "B": 1, "C": 2}).fillna(9)
-            df_15m_filtered = df_15m_filtered.sort_values(["__q_rank", "Timestamp"], ascending=[True, False]).drop(columns="__q_rank")
-            st.dataframe(df_15m_filtered, use_container_width=True)
+    with right:
+        st.markdown("### Daily Signals")
+        if df_daily_f.empty:
+            st.info("No matching Daily signals in this window.")
         else:
-            st.info("No signals match the selected Quality filter for 15M.")
+            st.dataframe(df_daily_f, use_container_width=True)
+            st.download_button(
+                "⬇️ Download Daily CSV",
+                df_daily_f.to_csv(index=False).encode("utf-8"),
+                file_name="trend_squeeze_daily_signals.csv",
+                mime="text/csv"
+            )
 
-    # ---- Daily ----
-    if not df_recent_daily.empty:
-        st.subheader("Daily Signals")
-        df_daily_filtered = _quality_filter_ui(df_recent_daily, "Daily Signals")
-        if not df_daily_filtered.empty:
-            df_daily_filtered["__q_rank"] = df_daily_filtered["Quality"].map({"A": 0, "B": 1, "C": 2}).fillna(9)
-            df_daily_filtered = df_daily_filtered.sort_values(["__q_rank", "Timestamp"], ascending=[True, False]).drop(columns="__q_rank")
-            st.dataframe(df_daily_filtered, use_container_width=True)
-        else:
-            st.info("No signals match the selected Quality filter for Daily.")
-else:
-    st.info("No signals in recent trading sessions.")
+    st.markdown("---")
+
+    # Scan controls kept minimal here
+    scan_now = st.button("🔄 Scan Now (log new signals)", type="primary", disabled=(not fyers_ok or not fyers_health_ok))
+
+    auto_scan = st.session_state.auto_scan_market_hours and market_open_now()
+    do_scan = scan_now or auto_scan
+
+    if not (fyers_ok and fyers_health_ok) and (scan_now):
+        st.warning("Scan disabled: FYERS not healthy. Fix token first.")
+
+    if do_scan and fyers_ok and fyers_health_ok and ws_15m and ws_daily and not ws_15m_err and not ws_daily_err:
+        with st.spinner("Scanning NIFTY50 (15M + Daily) and logging new signals..."):
+            show_debug = bool(st.session_state.show_debug)
+
+            use_setup_col = "setup" if st.session_state.signal_mode.startswith("✅") else "setup_forming"
+
+            bbw_abs, bbw_pct, adx_thr, rsi_bull, rsi_bear = get_profile_thresholds(st.session_state.param_profile)
+            params_hash = params_to_hash(bbw_abs, bbw_pct, adx_thr, rsi_bull, rsi_bear)
+
+            existing_keys_15m = fetch_existing_keys_recent(ws_15m, days_back=3)
+            existing_keys_daily = fetch_existing_keys_recent(ws_daily, days_back=10)
+
+            rows_15m, rows_daily = [], []
+
+            # 15M scan
+            if st.session_state.scan_parallel:
+                errs = []
+                with ThreadPoolExecutor(max_workers=int(st.session_state.parallel_workers)) as ex:
+                    futs = [
+                        ex.submit(
+                            scan_symbol_15m,
+                            sym,
+                            use_setup_col,
+                            int(st.session_state.catchup_candles_15m),
+                            existing_keys_15m,
+                            params_hash,
+                        )
+                        for sym in stock_list
+                    ]
+                    for fut in as_completed(futs):
+                        rws, err = fut.result()
+                        if rws:
+                            rows_15m.extend(rws)
+                        if err:
+                            errs.append(err)
+
+                if show_debug and errs:
+                    st.warning(f"15M scan had {len(errs)} errors (showing first 3): {errs[:3]}")
+            else:
+                for sym in stock_list:
+                    rws, err = scan_symbol_15m(
+                        sym,
+                        use_setup_col,
+                        int(st.session_state.catchup_candles_15m),
+                        existing_keys_15m,
+                        params_hash,
+                    )
+                    rows_15m.extend(rws)
+                    if show_debug and err:
+                        st.warning(f"{sym} 15M error: {err}")
+
+            # Daily scan (ALL 50)
+            if st.session_state.scan_parallel:
+                errs = []
+                with ThreadPoolExecutor(max_workers=int(st.session_state.parallel_workers)) as ex:
+                    futs = [
+                        ex.submit(
+                            scan_symbol_daily,
+                            sym,
+                            use_setup_col,
+                            existing_keys_daily,
+                            params_hash,
+                        )
+                        for sym in stock_list
+                    ]
+                    for fut in as_completed(futs):
+                        rws, err = fut.result()
+                        if rws:
+                            rows_daily.extend(rws)
+                        if err:
+                            errs.append(err)
+                if show_debug and errs:
+                    st.warning(f"Daily scan had {len(errs)} errors (showing first 3): {errs[:3]}")
+            else:
+                for sym in stock_list:
+                    rws, err = scan_symbol_daily(sym, use_setup_col, existing_keys_daily, params_hash)
+                    rows_daily.extend(rws)
+                    if show_debug and err:
+                        st.warning(f"{sym} Daily error: {err}")
+
+            appended_15m, _ = append_signals(ws_15m, rows_15m, show_debug)
+            appended_daily, _ = append_signals(ws_daily, rows_daily, show_debug)
+
+        st.success(f"Logged {appended_15m} new 15M + {appended_daily} new Daily signals.")
+        st.rerun()
 
 
-with backtest_tab:
+# -------------------- Backtest (kept simple) --------------------
+with tab_backtest:
     st.markdown("## 📜 Trend Squeeze Backtest (15M)")
 
     def run_backtest_15m(symbols, days_back=30, params=None):
@@ -958,9 +1016,9 @@ with backtest_tab:
         trades = []
         total_bars = 0
 
-        for symbol in symbols[:10]:
+        for symbol in symbols:
             try:
-                df = ohlc_15m_cached(symbol, days_back=days_back)
+                df = get_ohlc_15min(symbol, days_back=days_back)
                 if df is None or len(df) < 100:
                     continue
 
@@ -976,8 +1034,8 @@ with backtest_tab:
                     require_volume_spike=False,
                     volume_spike_mult=1.5,
                 )
-                df_prepped = prepare_trend_squeeze(df, **kwargs)
 
+                df_prepped = prepare_trend_squeeze(df, **kwargs)
                 signals = df_prepped[df_prepped["setup"] != ""]
                 total_bars += len(df_prepped)
 
@@ -997,7 +1055,6 @@ with backtest_tab:
                         "ADX": float(row.get("adx", np.nan)),
                         "Quality": compute_quality_score(row),
                     })
-
             except Exception:
                 continue
 
@@ -1007,18 +1064,16 @@ with backtest_tab:
     with col_bt1:
         bt_days = st.slider("Days back", 10, 90, 30, step=5)
     with col_bt2:
-        bt_symbols = st.slider("Symbols", 5, 20, 10, step=1)
+        bt_symbols = st.slider("Symbols", 5, 50, 10, step=5)
     with col_bt3:
-        bt_profile = st.selectbox("Profile", ["Normal", "Conservative", "Aggressive"])
+        bt_profile = st.selectbox("Profile", ["Normal", "Conservative", "Aggressive"], index=0)
 
-    if bt_profile == "Conservative":
-        bt_params = {"bbw_abs_threshold": 0.035, "bbw_pct_threshold": 0.25, "adx_threshold": 25.0, "rsi_bull": 60.0, "rsi_bear": 40.0}
-    elif bt_profile == "Aggressive":
-        bt_params = {"bbw_abs_threshold": 0.065, "bbw_pct_threshold": 0.45, "adx_threshold": 18.0, "rsi_bull": 52.0, "rsi_bear": 48.0}
-    else:
-        bt_params = {"bbw_abs_threshold": 0.05, "bbw_pct_threshold": 0.35, "adx_threshold": 20.0, "rsi_bull": 55.0, "rsi_bear": 45.0}
+    bbw_abs, bbw_pct, adx_thr, rsi_bull, rsi_bear = get_profile_thresholds(bt_profile)
+    bt_params = {"bbw_abs_threshold": bbw_abs, "bbw_pct_threshold": bbw_pct, "adx_threshold": adx_thr, "rsi_bull": rsi_bull, "rsi_bear": rsi_bear}
 
     if st.button("🚀 Run Backtest", type="primary"):
+        if not (fyers_ok and fyers_health_ok):
+            st.warning("FYERS not healthy: backtest may fail. Fix token first.")
         with st.spinner("Running backtest on FYERS data..."):
             bt_results, total_bars = run_backtest_15m(stock_list[:bt_symbols], bt_days, bt_params)
 
@@ -1030,9 +1085,15 @@ with backtest_tab:
             c2.metric("B Signals", int(q_counts.get("B", 0)))
             c3.metric("C Signals", int(q_counts.get("C", 0)))
             st.dataframe(bt_results, use_container_width=True)
+            st.download_button(
+                "⬇️ Download Backtest CSV",
+                bt_results.to_csv(index=False).encode("utf-8"),
+                file_name="trend_squeeze_backtest.csv",
+                mime="text/csv"
+            )
         else:
             st.warning("No signals found in the selected backtest period.")
 
-st.markdown("---")
-st.caption("✅ FYERS-powered: real-time data + dual timeframe + market-aware signals + backtest.")
 
+st.markdown("---")
+st.caption("✅ FYERS-powered: signals-first UI • dual timeframe • market-aware window • CSV export • backtest.")
