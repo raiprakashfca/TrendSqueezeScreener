@@ -97,9 +97,14 @@ def ts_to_sheet_str(ts) -> str:
 
 
 def to_ist(ts):
-    """Normalize timestamp to IST (Asia/Kolkata) and return naive datetime."""
+    """Normalize a timestamp to IST (Asia/Kolkata) and return tz-naive.
+    FYERS candles often arrive as UTC-naive; we treat naive timestamps as UTC and convert to IST.
+    """
     t = pd.Timestamp(ts)
-    if t.tzinfo is not None:
+    if t.tzinfo is None:
+        # Treat naive as UTC, then convert to IST
+        t = t.tz_localize("UTC").tz_convert("Asia/Kolkata").tz_localize(None)
+    else:
         t = t.tz_convert("Asia/Kolkata").tz_localize(None)
     return t
 
