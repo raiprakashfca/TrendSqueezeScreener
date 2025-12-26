@@ -884,16 +884,63 @@ with live_tab:
     df_recent_15m = pd.DataFrame() if not ws_15m else load_recent_signals(ws_15m, retention_hours, "15M", audit_mode=audit_mode)
     df_recent_daily = pd.DataFrame() if not ws_daily else load_recent_signals(ws_daily, retention_hours, "Daily", audit_mode=audit_mode)
 
-    if not df_recent_15m.empty or not df_recent_daily.empty:
-        st.markdown("### 🧠 Recent Signals (Market-Aware)")
-        if not df_recent_15m.empty:
-            st.subheader("15M Signals")
-            st.dataframe(df_recent_15m, use_container_width=True)
-        if not df_recent_daily.empty:
-            st.subheader("Daily Signals")
-            st.dataframe(df_recent_daily, use_container_width=True)
-    else:
-        st.info("No signals in recent trading sessions.")
+def _quality_filter_ui(df: pd.DataFrame, label: str) -> pd.DataFrame:
+    """
+    Default: show only Quality A.
+    B/C are hidden behind an expander + multiselect.
+    """
+    if df.empty or "Quality" not in df.columns:
+        return df
+
+    # Default view
+    default_qualities = ["A"]
+
+    with st.expander(f"🔎 {label}: show/hide Quality levels", expanded=False):
+        qualities = ["A", "B", "C"]
+        show_q = st.multiselect(
+            "Show qualities",
+            options=qualities,
+            default=default_qualities,
+            help="Default is only A. Add B/C if you want more (and noisier) signals."
+        )
+
+        # Optional: quick toggle
+        show_all = st.checkbox("Show all qualities (A+B+C)", value=False)
+        if show_all:
+            show_q = qualities
+
+    # Apply filter (if user unselects everything, show nothing)
+    return df[df["Quality"].isin(show_q)].copy()
+
+
+if not df_recent_15m.empty or not df_recent_daily.empty:
+    st.markdown("### 🧠 Recent Signals (Market-Aware)")
+
+    # ---- 15M ----
+    if not df_recent_15m.empty:
+        st.subheader("15M Signals")
+        df_15m_filtered = _quality_filter_ui(df_recent_15m, "15M Signals")
+        if not df_15m_filtered.empty:
+            # A-first ordering (and then newest first)
+            df_15m_filtered["__q_rank"] = df_15m_filtered["Quality"].map({"A": 0, "B": 1, "C": 2}).fillna(9)
+            df_15m_filtered = df_15m_filtered.sort_values(["__q_rank", "Timestamp"], ascending=[True, False]).drop(columns="__q_rank")
+            st.dataframe(df_15m_filtered, use_container_width=True)
+        else:
+            st.info("No signals match the selected Quality filter for 15M.")
+
+    # ---- Daily ----
+    if not df_recent_daily.empty:
+        st.subheader("Daily Signals")
+        df_daily_filtered = _quality_filter_ui(df_recent_daily, "Daily Signals")
+        if not df_daily_filtered.empty:
+            df_daily_filtered["__q_rank"] = df_daily_filtered["Quality"].map({"A": 0, "B": 1, "C": 2}).fillna(9)
+            df_daily_filtered = df_daily_filtered.sort_values(["__q_rank", "Timestamp"], ascending=[True, False]).drop(columns="__q_rank")
+            st.dataframe(df_daily_filtered, use_container_width=True)
+        else:
+            st.info("No signals match the selected Quality filter for Daily.")
+else:
+    st.info("No signals in recent trading sessions.")
+
 
 with backtest_tab:
     st.markdown("## 📜 Trend Squeeze Backtest (15M)")
@@ -988,3 +1035,4 @@ with backtest_tab:
 
 st.markdown("---")
 st.caption("✅ FYERS-powered: real-time data + dual timeframe + market-aware signals + backtest.")
+
