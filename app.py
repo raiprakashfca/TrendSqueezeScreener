@@ -4,6 +4,7 @@ from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 import json
 import inspect
+import string
 
 import numpy as np
 import pandas as pd
@@ -37,7 +38,7 @@ MARKET_CLOSE = time(15, 30)
 SIGNAL_SHEET_15M = "TrendSqueezeSignals_15M"
 SIGNAL_SHEET_DAILY = "TrendSqueezeSignals_Daily"
 
-# Direct Sheet IDs (from your URLs)
+# Direct Sheet IDs
 SHEET_ID_15M = "1RP2tbh6WnMgEDAv5FWXD6GhePXno9bZ81ILFyoX6Fb8"
 SHEET_ID_DAILY = "1u-W5vu3KM6XPRr78o8yyK8pPaAjRUIFEEYKHyYGUsM0"
 
@@ -61,11 +62,14 @@ SIGNAL_COLUMNS = [
 ]
 
 # -------------------- Helpers: Time --------------------
-def now_ist() -> datetime:
+def now_ist_aware() -> datetime:
     return datetime.now(IST)
 
+def now_ist_naive() -> datetime:
+    return now_ist_aware().replace(tzinfo=None)
+
 def market_open_now() -> bool:
-    n = now_ist()
+    n = now_ist_aware()
     return is_trading_day(n.date()) and MARKET_OPEN <= n.time() <= MARKET_CLOSE
 
 def fmt_dt(dt: datetime) -> str:
@@ -73,39 +77,28 @@ def fmt_dt(dt: datetime) -> str:
 
 def fmt_ts(ts) -> str:
     t = pd.Timestamp(ts)
-    t = to_ist(t)
+    # candles now come IST-naive from utils; keep consistent
     return t.strftime("%d-%b-%Y %H:%M")
 
-def ts_to_sheet_str(ts) -> str:
-    """Stable candle timestamp string for de-dupe + sheet storage (IST)."""
-    t = pd.Timestamp(ts)
-    t = to_ist(t).floor("15min")
-    return t.strftime("%Y-%m-%d %H:%M")
-
-def to_ist(ts):
-    """
-    Normalize timestamp to IST and return tz-naive.
-    IMPORTANT:
-    - FYERS candles can arrive as UTC-naive.
-    - Some sources return IST-naive.
-    Heuristic:
-      If tz-naive time is before 08:00, treat as UTC (common for market candles in UTC).
-      Else treat as IST.
-    """
-    t = pd.Timestamp(ts)
-
-    if t.tzinfo is None:
-        # tz-naive heuristic
-        if (t.hour < 8):  # likely UTC (03:45..10:00 UTC maps to 09:15..15:30 IST)
-            t = t.tz_localize("UTC").tz_convert("Asia/Kolkata").tz_localize(None)
-        else:
-            t = t.tz_localize("Asia/Kolkata").tz_localize(None)
-    else:
-        t = t.tz_convert("Asia/Kolkata").tz_localize(None)
-
-    return t
+def _col_letter(n: int) -> str:
+    # 1->A, 2->B ...
+    letters = ""
+    while n:
+        n, rem = divmod(n - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
 
 # -------------------- Google Sheets Auth --------------------
+@st.cache_resource(show_spinner=False)
+def _gspread_client_cached(sa_json_str: str):
+    scope = [
+        "https://spreadsheets.google.com/feeds",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    sa = json.loads(sa_json_str)
+    creds = ServiceAccountCredentials.from_json_keyfile_dict(sa, scope)
+    return gspread.authorize(creds)
+
 def get_gspread_client():
     try:
         raw = st.secrets["gcp_service_account"]
@@ -114,16 +107,12 @@ def get_gspread_client():
 
     try:
         sa = json.loads(raw) if isinstance(raw, str) else dict(raw)
+        sa_str = json.dumps(sa, sort_keys=True)
     except Exception as e:
         return None, f"Invalid gcp_service_account format: {e}"
 
-    scope = [
-        "https://spreadsheets.google.com/feeds",
-        "https://www.googleapis.com/auth/drive",
-    ]
     try:
-        creds = ServiceAccountCredentials.from_json_keyfile_dict(sa, scope)
-        return gspread.authorize(creds), None
+        return _gspread_client_cached(sa_str), None
     except Exception as e:
         return None, f"gspread auth failed: {e}"
 
@@ -201,12 +190,15 @@ def ensure_fyers_row_exists(ws):
 
 def update_fyers_token(ws, token: str, timestamp: str):
     header = [h.strip() for h in ws.row_values(1)]
+    changed = False
 
     if "fyers_access_token" not in header:
         header.append("fyers_access_token")
-        ws.update("A1", [header])
+        changed = True
     if "fyers_token_updated_at" not in header:
         header.append("fyers_token_updated_at")
+        changed = True
+    if changed:
         ws.update("A1", [header])
 
     col_token = header.index("fyers_access_token") + 1
@@ -240,10 +232,19 @@ def exchange_auth_code_for_token(app_id: str, secret_id: str, redirect_uri: str,
         raise RuntimeError(f"Token exchange failed: {resp}")
     return str(resp["access_token"]).strip()
 
+# -------------------- OHLC caching (biggest performance win) --------------------
+@st.cache_data(ttl=290, show_spinner=False)  # ~matches 5-min refresh
+def ohlc_15m_cached(symbol: str, days_back: int):
+    return get_ohlc_15min(symbol, days_back=days_back)
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)  # daily doesn’t change often
+def ohlc_daily_cached(symbol: str, lookback_days: int):
+    return get_ohlc_daily(symbol, lookback_days=lookback_days)
+
 @st.cache_data(ttl=120, show_spinner=False)
 def fyers_smoke_test() -> tuple[bool, str]:
     try:
-        df = get_ohlc_15min("RELIANCE", days_back=2)
+        df = ohlc_15m_cached("RELIANCE", days_back=2)
         if df is None or len(df) < 10:
             return False, "OHLC returned empty/too short"
         return True, "OK"
@@ -255,6 +256,7 @@ def get_signals_worksheet(sheet_name: str):
     client, err = get_gspread_client()
     if err:
         return None, err
+
     try:
         if sheet_name == SIGNAL_SHEET_15M and SHEET_ID_15M:
             sh = client.open_by_key(SHEET_ID_15M)
@@ -272,35 +274,50 @@ def get_signals_worksheet(sheet_name: str):
     except Exception as e:
         return None, f"Failed to access sheet1: {e}"
 
+    # Ensure header EXACT match (avoid partial mismatch bugs)
     try:
         header = ws.row_values(1)
-        if not header:
-            ws.append_row(SIGNAL_COLUMNS)
-        else:
-            if header[: len(SIGNAL_COLUMNS)] != SIGNAL_COLUMNS and len(header) < len(SIGNAL_COLUMNS):
-                ws.update("A1", [SIGNAL_COLUMNS])
+        if header != SIGNAL_COLUMNS:
+            ws.update("A1", [SIGNAL_COLUMNS])
     except Exception as e:
         return None, f"Failed to ensure headers: {e}"
 
     return ws, None
 
-def fetch_existing_keys_recent(ws, days_back: int = 3) -> set:
+def fetch_existing_keys_recent(ws, days_back: int = 3) -> set[str]:
+    """
+    Fast de-dupe: reads only columns A:B (key, signal_time).
+    """
     try:
-        records = ws.get_all_records()
+        rows = ws.get("A:B")
     except Exception:
         return set()
-    if not records:
+
+    if not rows or len(rows) < 2:
         return set()
-    df = pd.DataFrame(records)
-    if "key" not in df.columns or "signal_time" not in df.columns:
-        return set(df.get("key", pd.Series(dtype=str)).astype(str).tolist())
 
-    df["signal_time_dt"] = pd.to_datetime(df["signal_time"], errors="coerce")
-    df = df[df["signal_time_dt"].notna()]
-    df["signal_time_dt"] = df["signal_time_dt"].apply(to_ist)
+    data = rows[1:]  # skip header
+    keys = []
+    times = []
+    for r in data:
+        if not r:
+            continue
+        k = (r[0] if len(r) >= 1 else "") or ""
+        t = (r[1] if len(r) >= 2 else "") or ""
+        if k:
+            keys.append(str(k))
+            times.append(str(t))
 
-    cutoff = now_ist().replace(tzinfo=None) - timedelta(days=days_back)
-    df = df[df["signal_time_dt"] >= cutoff]
+    if not keys:
+        return set()
+
+    df = pd.DataFrame({"key": keys, "signal_time": times})
+    # parse both "YYYY-MM-DD HH:MM" and "YYYY-MM-DD"
+    df["dt"] = pd.to_datetime(df["signal_time"], errors="coerce")
+    df = df[df["dt"].notna()].copy()
+
+    cutoff = now_ist_naive() - timedelta(days=days_back)
+    df = df[df["dt"] >= cutoff]
     return set(df["key"].astype(str).tolist())
 
 def append_signals(ws, rows: list[list], show_debug: bool = False) -> tuple[int, str | None]:
@@ -348,7 +365,7 @@ def compute_quality_score(row):
     return "C"
 
 def get_market_aware_window(base_hours: int, timeframe: str = "15M") -> int:
-    now = now_ist()
+    now = now_ist_aware()
     target_date = now.date()
     trading_days_back = 0
     calendar_days_back = 0
@@ -362,25 +379,37 @@ def get_market_aware_window(base_hours: int, timeframe: str = "15M") -> int:
         smart_hours *= 24
     return min(smart_hours, base_hours * 2)
 
-def load_recent_signals(ws, base_hours: int = 24, timeframe: str = "15M", audit_mode: bool = False) -> pd.DataFrame:
+def load_recent_signals(ws, base_hours: int = 24, timeframe: str = "15M", audit_mode: bool = False, max_rows: int = 1500) -> pd.DataFrame:
+    """
+    Faster loader: pulls A:P (used range) and only keeps the last `max_rows`.
+    """
+    last_col = _col_letter(len(SIGNAL_COLUMNS))  # A..P for 16
+    rng = f"A:{last_col}"
+
     try:
-        records = ws.get_all_records()
+        values = ws.get(rng)
     except Exception:
         return pd.DataFrame()
-    if not records:
+
+    if not values or len(values) < 2:
         return pd.DataFrame()
 
-    df = pd.DataFrame(records)
+    header = values[0]
+    rows = values[1:]
+    if len(rows) > max_rows:
+        rows = rows[-max_rows:]
+
+    df = pd.DataFrame(rows, columns=header[: len(rows[0])] if rows else header)
+    # ensure expected cols exist
     for c in SIGNAL_COLUMNS:
         if c not in df.columns:
             df[c] = None
 
     df["signal_time_dt"] = pd.to_datetime(df["signal_time"], errors="coerce")
-    df = df[df["signal_time_dt"].notna()]
-    df["signal_time_dt"] = df["signal_time_dt"].apply(to_ist)
+    df = df[df["signal_time_dt"].notna()].copy()
 
     smart_hours = get_market_aware_window(base_hours, timeframe)
-    cutoff = now_ist().replace(tzinfo=None) - timedelta(hours=smart_hours)
+    cutoff = now_ist_naive() - timedelta(hours=smart_hours)
     df = df[df["signal_time_dt"] >= cutoff].copy()
     if df.empty:
         return df
@@ -422,13 +451,13 @@ with st.sidebar:
     except Exception as e:
         ws_fyers, ws_fyers_err = None, str(e)
 
+    app_id_sheet = secret_id_sheet = token_sheet = updated_at_sheet = ""
+
     if ws_fyers_err:
         st.error("FYERS token sheet ❌")
         st.caption(ws_fyers_err)
-        app_id_sheet = secret_id_sheet = token_sheet = updated_at_sheet = ""
     else:
         app_id_sheet, secret_id_sheet, token_sheet, updated_at_sheet = read_fyers_row(ws_fyers)
-
         if token_sheet:
             st.success("Token found in Google Sheet ✅")
         else:
@@ -441,33 +470,32 @@ with st.sidebar:
     st.subheader("🔑 Generate / Update FYERS Access Token")
     redirect_uri = st.secrets.get("FYERS_REDIRECT_URI", "https://trade.fyers.in/api-login/redirect-uri/index.html")
 
-    if not app_id_sheet or not secret_id_sheet:
-        st.error("Missing fyers_app_id / fyers_secret_id in the FYERS token sheet (row 2).")
-        st.stop()
+    if not ws_fyers_err and ws_fyers and app_id_sheet and secret_id_sheet:
+        try:
+            login_url = build_fyers_login_url(app_id_sheet, secret_id_sheet, redirect_uri)
+            st.link_button("1) Open FYERS Login", login_url)
+            st.caption("After login, copy `auth_code` from redirected URL and paste below.")
+        except Exception as e:
+            st.error(f"Could not generate login URL: {e}")
+            login_url = None
 
-    try:
-        login_url = build_fyers_login_url(app_id_sheet, secret_id_sheet, redirect_uri)
-        st.link_button("1) Open FYERS Login", login_url)
-        st.caption("After login, copy `auth_code` from redirected URL and paste below.")
-    except Exception as e:
-        st.error(f"Could not generate login URL: {e}")
-        login_url = None
+        auth_code = st.text_input("2) Paste auth_code here", value="", help="From redirected URL after FYERS login.")
 
-    auth_code = st.text_input("2) Paste auth_code here", value="", help="From redirected URL after FYERS login.")
-
-    if st.button("3) Exchange & Save Token", type="primary"):
-        if not auth_code.strip():
-            st.error("Please paste the auth_code first.")
-        else:
-            try:
-                token = exchange_auth_code_for_token(app_id_sheet, secret_id_sheet, redirect_uri, auth_code.strip())
-                ts = now_ist().strftime("%Y-%m-%d %H:%M:%S")
-                update_fyers_token(ws_fyers, token, ts)
-                st.success("Saved access token + timestamp to the FYERS sheet ✅")
-                st.cache_data.clear()
-                st.rerun()
-            except Exception as e:
-                st.error(f"Token exchange failed: {e}")
+        if st.button("3) Exchange & Save Token", type="primary"):
+            if not auth_code.strip():
+                st.error("Please paste the auth_code first.")
+            else:
+                try:
+                    token = exchange_auth_code_for_token(app_id_sheet, secret_id_sheet, redirect_uri, auth_code.strip())
+                    ts = now_ist_naive().strftime("%Y-%m-%d %H:%M:%S")
+                    update_fyers_token(ws_fyers, token, ts)
+                    st.success("Saved access token + timestamp to the FYERS sheet ✅")
+                    st.cache_data.clear()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Token exchange failed: {e}")
+    else:
+        st.info("Add fyers_app_id + fyers_secret_id in FYERS token sheet row 2 to enable login flow.")
 
 # -------------------- FYERS INIT --------------------
 fyers_ok = False
@@ -479,7 +507,7 @@ app_id_sheet, secret_id_sheet, token_sheet, updated_at_sheet = ("", "", "", "")
 if not ws_fyers_err and ws_fyers:
     app_id_sheet, secret_id_sheet, token_sheet, updated_at_sheet = read_fyers_row(ws_fyers)
 
-if token_sheet:
+if token_sheet and app_id_sheet:
     try:
         init_fyers_session(app_id_sheet, token_sheet)
         fyers_ok = True
@@ -495,7 +523,7 @@ else:
 
 # -------------------- Main UI Header --------------------
 st.title("📉 Trend Squeeze Screener (15M + Daily) - Market Aware")
-n = now_ist()
+n = now_ist_aware()
 mode_str = "🟢 LIVE MARKET" if market_open_now() else "🔵 OFF-MARKET"
 st.caption(f"{mode_str} • Last refresh: {n.strftime('%d %b %Y • %H:%M:%S')} IST")
 
@@ -522,7 +550,7 @@ st.caption(f"Universe: NIFTY50 ({len(stock_list)} symbols).")
 
 live_tab, backtest_tab = st.tabs(["📺 Live Screener (15M + Daily)", "📜 Backtest"])
 
-# ---------- Signature detection (keeps app compatible if strategy.py is older) ----------
+# ---------- Signature detection ----------
 _STRAT_SIG = inspect.signature(prepare_trend_squeeze)
 _HAS_ENGINE = "engine" in _STRAT_SIG.parameters
 _HAS_BOX_WIDTH = "box_width_pct_max" in _STRAT_SIG.parameters
@@ -535,12 +563,13 @@ with live_tab:
     with st.sidebar:
         st.markdown("---")
         st.subheader("⚙️ Screener Settings")
+
         show_debug = st.checkbox("Show debug messages", value=False)
 
         audit_mode = st.checkbox(
             "Audit mode (show all signals, no de-dup)",
             value=False,
-            help="Useful to verify whether the app logged a 24-Dec signal but UI hid it due to de-dup."
+            help="Useful to verify whether the app logged something but UI hid it due to de-dup."
         )
 
         st.markdown("---")
@@ -576,7 +605,7 @@ with live_tab:
                 engine_arg = "hybrid"
         else:
             engine_arg = None
-            st.info("Your current utils/strategy.py does not support Engine controls. (App will still work.)")
+            st.info("Your strategy.py does not support Engine controls. (App will still work.)")
 
         if _HAS_BOX_WIDTH:
             box_width_pct_max = st.slider("Max box width (%)", 0.3, 3.0, 1.2, 0.1) / 100.0
@@ -631,28 +660,52 @@ with live_tab:
     smart_retention_daily = get_market_aware_window(retention_hours, "Daily")
     st.caption(f"🧠 Showing last ~{smart_retention_15m}h trading time (15M) | ~{smart_retention_daily/24:.0f} trading days (Daily)")
 
+    # --- Sheets status (FIXED: no ternary Streamlit calls) ---
     col1_15m, col2_daily = st.columns(2)
+
     with col1_15m:
         ws_15m, ws_15m_err = get_signals_worksheet(SIGNAL_SHEET_15M)
-        st.success("15M Sheets ✅") if not ws_15m_err else st.error(f"15M Sheets ❌: {ws_15m_err}")
+        if ws_15m_err:
+            st.error(f"15M Sheets ❌: {ws_15m_err}")
+        else:
+            st.success("15M Sheets ✅")
+
     with col2_daily:
         ws_daily, ws_daily_err = get_signals_worksheet(SIGNAL_SHEET_DAILY)
-        st.success("Daily Sheets ✅") if not ws_daily_err else st.error(f"Daily Sheets ❌: {ws_daily_err}")
+        if ws_daily_err:
+            st.error(f"Daily Sheets ❌: {ws_daily_err}")
+        else:
+            st.success("Daily Sheets ✅")
 
     existing_keys_15m = fetch_existing_keys_recent(ws_15m, days_back=3) if ws_15m and not ws_15m_err else set()
-    existing_keys_daily = fetch_existing_keys_recent(ws_daily, days_back=7) if ws_daily and not ws_daily_err else set()
+    existing_keys_daily = fetch_existing_keys_recent(ws_daily, days_back=14) if ws_daily and not ws_daily_err else set()
 
     rows_15m, rows_daily = [], []
-    logged_at = fmt_dt(now_ist())
+    logged_at = fmt_dt(now_ist_naive())
 
-    # 15M scan
-    for symbol in stock_list:
+    # ----------- scan stats -----------
+    stats = {
+        "15m_scanned": 0,
+        "15m_skipped_short": 0,
+        "15m_errors": 0,
+        "daily_scanned": 0,
+        "daily_skipped_short": 0,
+        "daily_errors": 0,
+        "daily_throttled": False,
+    }
+
+    # -------------------- 15M scan (always) --------------------
+    prog = st.progress(0, text="Scanning 15M…")
+    for i, symbol in enumerate(stock_list):
+        stats["15m_scanned"] += 1
+        prog.progress(int((i + 1) / len(stock_list) * 100), text=f"Scanning 15M… {symbol}")
+
         try:
-            df = get_ohlc_15min(symbol, days_back=15)
+            df = ohlc_15m_cached(symbol, days_back=15)
             if df is None or df.shape[0] < 220:
+                stats["15m_skipped_short"] += 1
                 continue
 
-            # Base params supported by your existing strategy
             kwargs = dict(
                 bbw_abs_threshold=bbw_abs_threshold,
                 bbw_pct_threshold=bbw_pct_threshold,
@@ -666,8 +719,7 @@ with live_tab:
                 volume_spike_mult=volume_spike_mult,
             )
 
-            # Optional advanced params only if your strategy.py supports them
-            if _HAS_ENGINE:
+            if _HAS_ENGINE and engine_arg is not None:
                 kwargs["engine"] = engine_arg
             if _HAS_BOX_WIDTH and box_width_pct_max is not None:
                 kwargs["box_width_pct_max"] = box_width_pct_max
@@ -683,7 +735,8 @@ with live_tab:
             recent = recent[recent[use_setup_col] != ""]
 
             for candle_ts, r in recent.iterrows():
-                signal_time = to_ist(candle_ts).floor("15min").strftime("%Y-%m-%d %H:%M")
+                # candles already IST-naive
+                signal_time = pd.Timestamp(candle_ts).floor("15min").strftime("%Y-%m-%d %H:%M")
                 setup = r[use_setup_col]
                 trend = r.get("trend", "")
                 ltp = float(r.get("close", np.nan))
@@ -693,6 +746,8 @@ with live_tab:
                 adx_val = float(r.get("adx", np.nan))
 
                 bias = "LONG" if str(setup).startswith("Bullish") else "SHORT"
+
+                # keep key stable per candle+setup+bias (parameter changes go into params_hash column)
                 key = f"{symbol}|15M|Continuation|{signal_time}|{setup}|{bias}"
 
                 if key not in existing_keys_15m:
@@ -705,81 +760,127 @@ with live_tab:
                     existing_keys_15m.add(key)
 
         except Exception as e:
+            stats["15m_errors"] += 1
             if show_debug:
                 st.warning(f"{symbol} 15M error: {e}")
             continue
 
-    # Daily scan (limit to first 20 for speed)
-    lookback_days_daily = 252
-    for symbol in stock_list[:20]:
-        try:
-            df_daily = get_ohlc_daily(symbol, lookback_days=lookback_days_daily)
-            if df_daily is None or df_daily.shape[0] < 100:
+    prog.empty()
+
+    # -------------------- Daily scan (ALL 50) with throttle --------------------
+    # Improvement: avoid re-running heavy Daily compute every 5 minutes.
+    # We still INCLUDE all 50, but we compute at most once per hour (unless first run).
+    throttle_minutes = 60
+    last_daily_run = st.session_state.get("last_daily_scan_ts", None)
+    now_naive = now_ist_naive()
+
+    should_run_daily = True
+    if last_daily_run is not None:
+        if isinstance(last_daily_run, str):
+            last_daily_run = pd.to_datetime(last_daily_run)
+        if now_naive - last_daily_run < timedelta(minutes=throttle_minutes):
+            should_run_daily = False
+
+    if not should_run_daily:
+        stats["daily_throttled"] = True
+    else:
+        st.session_state["last_daily_scan_ts"] = now_naive
+
+        lookback_days_daily = 252
+        prog2 = st.progress(0, text="Scanning Daily…")
+        for i, symbol in enumerate(stock_list):  # ✅ all 50
+            stats["daily_scanned"] += 1
+            prog2.progress(int((i + 1) / len(stock_list) * 100), text=f"Scanning Daily… {symbol}")
+
+            try:
+                df_daily = ohlc_daily_cached(symbol, lookback_days=lookback_days_daily)
+                if df_daily is None or df_daily.shape[0] < 100:
+                    stats["daily_skipped_short"] += 1
+                    continue
+
+                kwargs = dict(
+                    bbw_abs_threshold=bbw_abs_threshold * 1.2,
+                    bbw_pct_threshold=bbw_pct_threshold,
+                    adx_threshold=adx_threshold,
+                    rsi_bull=rsi_bull,
+                    rsi_bear=rsi_bear,
+                    rolling_window=20,
+                    breakout_lookback=breakout_lookback,
+                    require_bbw_expansion=require_bbw_expansion,
+                    require_volume_spike=require_volume_spike,
+                    volume_spike_mult=volume_spike_mult,
+                )
+
+                if _HAS_ENGINE and engine_arg is not None:
+                    kwargs["engine"] = engine_arg
+                if _HAS_BOX_WIDTH and box_width_pct_max is not None:
+                    kwargs["box_width_pct_max"] = box_width_pct_max
+                if _HAS_DI and require_di_confirmation is not None:
+                    kwargs["require_di_confirmation"] = require_di_confirmation
+                if _HAS_RSI_FLOOR and rsi_floor_short is not None and rsi_ceiling_long is not None:
+                    kwargs["rsi_floor_short"] = rsi_floor_short
+                    kwargs["rsi_ceiling_long"] = rsi_ceiling_long
+
+                df_daily_prepped = prepare_trend_squeeze(df_daily, **kwargs)
+
+                recent_daily = df_daily_prepped.tail(5).copy()
+                recent_daily = recent_daily[recent_daily[use_setup_col] != ""]
+
+                for candle_ts, r in recent_daily.iterrows():
+                    signal_time = pd.Timestamp(candle_ts).floor("1D").strftime("%Y-%m-%d")
+                    setup = r[use_setup_col]
+                    trend = r.get("trend", "")
+                    ltp = float(r.get("close", np.nan))
+                    bbw = float(r.get("bbw", np.nan))
+                    bbw_rank = r.get("bbw_pct_rank", np.nan)
+                    rsi_val = float(r.get("rsi", np.nan))
+                    adx_val = float(r.get("adx", np.nan))
+
+                    bias = "LONG" if str(setup).startswith("Bullish") else "SHORT"
+                    key = f"{symbol}|Daily|Continuation|{signal_time}|{setup}|{bias}"
+
+                    if key not in existing_keys_daily:
+                        quality = compute_quality_score(r)
+                        rows_daily.append([
+                            key, signal_time, logged_at, symbol, "Daily", "Continuation",
+                            setup, bias, ltp, bbw, bbw_rank, rsi_val, adx_val, trend,
+                            quality, params_hash
+                        ])
+                        existing_keys_daily.add(key)
+
+            except Exception as e:
+                stats["daily_errors"] += 1
+                if show_debug:
+                    st.warning(f"{symbol} Daily error: {e}")
                 continue
 
-            kwargs = dict(
-                bbw_abs_threshold=bbw_abs_threshold * 1.2,
-                bbw_pct_threshold=bbw_pct_threshold,
-                adx_threshold=adx_threshold,
-                rsi_bull=rsi_bull,
-                rsi_bear=rsi_bear,
-                rolling_window=20,
-                breakout_lookback=breakout_lookback,
-                require_bbw_expansion=require_bbw_expansion,
-                require_volume_spike=require_volume_spike,
-                volume_spike_mult=volume_spike_mult,
-            )
-            if _HAS_ENGINE:
-                kwargs["engine"] = engine_arg
-            if _HAS_BOX_WIDTH and box_width_pct_max is not None:
-                kwargs["box_width_pct_max"] = box_width_pct_max
-            if _HAS_DI and require_di_confirmation is not None:
-                kwargs["require_di_confirmation"] = require_di_confirmation
-            if _HAS_RSI_FLOOR and rsi_floor_short is not None and rsi_ceiling_long is not None:
-                kwargs["rsi_floor_short"] = rsi_floor_short
-                kwargs["rsi_ceiling_long"] = rsi_ceiling_long
+        prog2.empty()
 
-            df_daily_prepped = prepare_trend_squeeze(df_daily, **kwargs)
-
-            recent_daily = df_daily_prepped.tail(5).copy()
-            recent_daily = recent_daily[recent_daily[use_setup_col] != ""]
-
-            for candle_ts, r in recent_daily.iterrows():
-                signal_time = to_ist(candle_ts).floor("1D").strftime("%Y-%m-%d")
-                setup = r[use_setup_col]
-                trend = r.get("trend", "")
-                ltp = float(r.get("close", np.nan))
-                bbw = float(r.get("bbw", np.nan))
-                bbw_rank = r.get("bbw_pct_rank", np.nan)
-                rsi_val = float(r.get("rsi", np.nan))
-                adx_val = float(r.get("adx", np.nan))
-
-                bias = "LONG" if str(setup).startswith("Bullish") else "SHORT"
-                key = f"{symbol}|Daily|Continuation|{signal_time}|{setup}|{bias}"
-
-                if key not in existing_keys_daily:
-                    quality = compute_quality_score(r)
-                    rows_daily.append([
-                        key, signal_time, logged_at, symbol, "Daily", "Continuation",
-                        setup, bias, ltp, bbw, bbw_rank, rsi_val, adx_val, trend,
-                        quality, params_hash
-                    ])
-                    existing_keys_daily.add(key)
-
-        except Exception as e:
-            if show_debug:
-                st.warning(f"{symbol} Daily error: {e}")
-            continue
-
-    appended_15m = 0
-    appended_daily = 0
+    # -------------------- Write to sheets --------------------
+    appended_15m = appended_daily = 0
     if ws_15m and not ws_15m_err:
         appended_15m, _ = append_signals(ws_15m, rows_15m, show_debug)
-    if ws_daily and not ws_daily_err:
+    if ws_daily and not ws_daily_err and not stats["daily_throttled"]:
         appended_daily, _ = append_signals(ws_daily, rows_daily, show_debug)
+
+    # -------------------- Scan stats panel --------------------
+    with st.expander("🧾 Scan Health (what actually happened)", expanded=False):
+        cA, cB, cC = st.columns(3)
+        cA.metric("15M scanned", stats["15m_scanned"])
+        cB.metric("15M skipped (short data)", stats["15m_skipped_short"])
+        cC.metric("15M errors", stats["15m_errors"])
+
+        cD, cE, cF = st.columns(3)
+        cD.metric("Daily scanned", stats["daily_scanned"])
+        cE.metric("Daily skipped (short data)", stats["daily_skipped_short"])
+        cF.metric("Daily errors", stats["daily_errors"])
+
+        if stats["daily_throttled"]:
+            st.info("Daily scan throttled (runs at most once per hour). This is intentional to avoid heavy re-compute every 5 minutes.")
 
     st.caption(f"Logged **{appended_15m}** new 15M + **{appended_daily}** Daily signals.")
 
+    # -------------------- Display recent signals --------------------
     df_recent_15m = pd.DataFrame() if not ws_15m else load_recent_signals(ws_15m, retention_hours, "15M", audit_mode=audit_mode)
     df_recent_daily = pd.DataFrame() if not ws_daily else load_recent_signals(ws_daily, retention_hours, "Daily", audit_mode=audit_mode)
 
@@ -812,7 +913,7 @@ with backtest_tab:
 
         for symbol in symbols[:10]:
             try:
-                df = get_ohlc_15min(symbol, days_back=days_back)
+                df = ohlc_15m_cached(symbol, days_back=days_back)
                 if df is None or len(df) < 100:
                     continue
 
