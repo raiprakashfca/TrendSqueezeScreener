@@ -544,7 +544,7 @@ with st.sidebar:
         </button>
     </a>
     """,
-    unsafe_allow_html=True), key="btn_fyers_login")
+    unsafe_allow_html=True)
             st.caption("After login, copy `auth_code` from redirected URL and paste below.")
         except Exception as e:
             st.error(f"Login URL failed: {e}")
@@ -1088,5 +1088,6 @@ with st.expander("📜 Backtest (15M) — quick sanity check", expanded=False):
 
 # -------------------- Footer (minimal) --------------------
 st.caption("✅ FYERS-powered • IST timestamps • Quality-first display • Daily scan supports all 50 symbols.")
+
 
 
