@@ -536,7 +536,16 @@ with st.sidebar:
     else:
         try:
             login_url = build_fyers_login_url(app_id_sheet, secret_id_sheet, redirect_uri)
-            st.link_button("1) Open FYERS Login", login_url, key="btn_fyers_login")
+            st.markdown(
+    f"""
+    <a href="{login_url}" target="_blank">
+        <button style="width:100%;padding:8px;font-size:15px;">
+            👉 1) Open FYERS Login
+        </button>
+    </a>
+    """,
+    unsafe_allow_html=True
+), key="btn_fyers_login")
             st.caption("After login, copy `auth_code` from redirected URL and paste below.")
         except Exception as e:
             st.error(f"Login URL failed: {e}")
@@ -1080,3 +1089,4 @@ with st.expander("📜 Backtest (15M) — quick sanity check", expanded=False):
 
 # -------------------- Footer (minimal) --------------------
 st.caption("✅ FYERS-powered • IST timestamps • Quality-first display • Daily scan supports all 50 symbols.")
+
