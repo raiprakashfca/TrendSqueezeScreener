@@ -69,7 +69,29 @@ FYERS_TOKEN_HEADERS = [
     "fyers_access_token",
     "fyers_token_updated_at",
 ]
+with st.expander("🧹 One-time repair: convert non-IST timestamps in Sheets", expanded=False):
+    st.warning("This will edit existing rows in your Google Sheets. Ideally take a copy first.")
+    dry = st.checkbox("Dry run (report only, no writing)", value=True, key="repair_dry_run")
 
+    if st.button("Run repair on 15M + Daily sheets", type="primary", key="run_repair"):
+        if ws_15m_err or not ws_15m:
+            st.error(f"15M sheet not ready: {ws_15m_err}")
+        if ws_daily_err or not ws_daily:
+            st.error(f"Daily sheet not ready: {ws_daily_err}")
+
+        if (not ws_15m_err and ws_15m) and (not ws_daily_err and ws_daily):
+            with st.spinner("Repairing 15M sheet..."):
+                r15 = repair_sheet_timestamps(ws_15m, timeframe="15M", dry_run=dry)
+            with st.spinner("Repairing Daily sheet..."):
+                rd = repair_sheet_timestamps(ws_daily, timeframe="Daily", dry_run=dry)
+
+            st.success("Repair complete ✅")
+            st.json({"15M": r15, "Daily": rd})
+
+            if not dry:
+                st.info("Reloading caches + refreshing UI…")
+                st.cache_data.clear()
+                st.rerun()
 
 # =========================
 # Time helpers (IST)
@@ -989,3 +1011,4 @@ with st.expander("📜 Backtest (optional)", expanded=False):
             st.warning("No signals found in selected period.")
 
 st.caption("✅ FYERS-powered: Token-sheet login + live scan + breakout confirmation + cleaner UI + IST-correct candles.")
+
