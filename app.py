@@ -1,3 +1,4 @@
+# app.py
 from __future__ import annotations
 
 from datetime import datetime, time, timedelta
@@ -83,27 +84,19 @@ def market_open_now() -> bool:
 
 
 def fmt_dt(dt: datetime) -> str:
+    # store as tz-naive string, but it is IST context
     return dt.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def to_ist(ts):
     """
-    Normalize timestamp to IST and return tz-naive.
-
-    Heuristic:
-    - FYERS candles come as epoch seconds -> pandas Timestamp naive UTC when parsed via unit="s".
-    - If tz-naive AND hour < 8 => treat as UTC and convert to IST
-    - Else treat as IST
+    Convert tz-aware to IST-naive.
+    If tz-naive: assume it's already IST-naive (IMPORTANT for sheet timestamps).
     """
     t = pd.Timestamp(ts)
     if t.tzinfo is None:
-        if t.hour < 8:
-            t = t.tz_localize("UTC").tz_convert("Asia/Kolkata").tz_localize(None)
-        else:
-            t = t.tz_localize("Asia/Kolkata").tz_localize(None)
-    else:
-        t = t.tz_convert("Asia/Kolkata").tz_localize(None)
-    return t
+        return t.tz_localize(None)
+    return t.tz_convert("Asia/Kolkata").tz_localize(None)
 
 
 def fmt_ts(ts) -> str:
@@ -113,6 +106,40 @@ def fmt_ts(ts) -> str:
 def ts_to_sheet_str(ts, freq: str = "15min") -> str:
     t = to_ist(pd.Timestamp(ts)).floor(freq)
     return t.strftime("%Y-%m-%d %H:%M")
+
+
+def normalize_ohlc_index_to_ist(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    ✅ FIX FOR YOUR 'RUINED TIMESTAMP' ISSUE
+    FYERS history candles are epoch seconds -> your utils converts them into tz-naive timestamps
+    that represent UTC time. This function converts that index to IST-naive consistently.
+
+    - Applies ONLY to OHLC dataframes (not sheet timestamps).
+    - Safe if called multiple times.
+    """
+    if df is None or df.empty:
+        return df
+    if not isinstance(df.index, pd.DatetimeIndex):
+        return df
+
+    idx = df.index
+    if getattr(idx, "tz", None) is None:
+        # tz-naive -> treat as UTC and convert to IST
+        try:
+            new_idx = idx.tz_localize("UTC").tz_convert("Asia/Kolkata").tz_localize(None)
+            df = df.copy()
+            df.index = new_idx
+            return df
+        except Exception:
+            return df
+    else:
+        # tz-aware -> convert to IST-naive
+        try:
+            df = df.copy()
+            df.index = idx.tz_convert("Asia/Kolkata").tz_localize(None)
+            return df
+        except Exception:
+            return df
 
 
 # =========================
@@ -149,7 +176,7 @@ def get_fyers_token_worksheet():
     Optional: FYERS_TOKEN_SHEET_NAME
 
     IMPORTANT:
-    This app DOES NOT require fyers_app_id in Streamlit secrets if token sheet is configured.
+    This app does NOT require fyers_app_id in Streamlit secrets if token sheet is configured.
     """
     sheet_key = st.secrets.get("FYERS_TOKEN_SHEET_KEY", None)
     sheet_name = st.secrets.get("FYERS_TOKEN_SHEET_NAME", None)
@@ -273,8 +300,13 @@ def exchange_auth_code_for_token(app_id: str, secret_id: str, redirect_uri: str,
 def fyers_smoke_test() -> tuple[bool, str]:
     try:
         df = get_ohlc_15min("RELIANCE", days_back=2)
+        df = normalize_ohlc_index_to_ist(df)
         if df is None or len(df) < 10:
             return False, "OHLC returned empty/too short"
+        # quick sanity: last candle should be within reasonable hours (IST)
+        last_ts = df.index[-1]
+        if not (0 <= last_ts.hour <= 23):
+            return False, "Timestamp sanity failed"
         return True, "OK"
     except Exception as e:
         return False, str(e)[:200]
@@ -331,6 +363,7 @@ def fetch_existing_keys_recent(ws, days_back: int = 3) -> set:
 
     df["signal_time_dt"] = pd.to_datetime(df["signal_time"], errors="coerce")
     df = df[df["signal_time_dt"].notna()]
+    # IMPORTANT: sheet timestamps are IST-naive, so to_ist() must NOT shift them.
     df["signal_time_dt"] = df["signal_time_dt"].apply(to_ist)
 
     cutoff = now_ist().replace(tzinfo=None) - timedelta(days=days_back)
@@ -416,6 +449,7 @@ def load_recent_signals(ws, base_hours: int = 24, timeframe: str = "15M", audit_
 
     df["signal_time_dt"] = pd.to_datetime(df["signal_time"], errors="coerce")
     df = df[df["signal_time_dt"].notna()]
+    # IMPORTANT: sheet timestamps are IST-naive; do not shift
     df["signal_time_dt"] = df["signal_time_dt"].apply(to_ist)
 
     smart_hours = get_market_aware_window(base_hours, timeframe)
@@ -498,7 +532,6 @@ with st.sidebar:
     # Login URL
     try:
         login_url = build_fyers_login_url(app_id_sheet, secret_id_sheet, redirect_uri)
-        # No key arg here (your Streamlit build complained about key=)
         st.link_button("1) Open FYERS Login", login_url)
         st.caption("Login → copy `auth_code` from redirected URL → paste below.")
     except Exception as e:
@@ -528,6 +561,15 @@ with st.sidebar:
     audit_mode = st.checkbox("Audit mode (no de-dup)", value=False, key="audit_mode")
     retention_hours = st.slider("Retention (hours)", 6, 48, 24, 6, key="retention_hours")
 
+    with st.expander("🧠 Quality filter", expanded=False):
+        quality_pref = st.radio(
+            "Show quality",
+            ["A only", "A + B", "A + B + C"],
+            index=0,
+            key="quality_pref",
+            horizontal=True,
+        )
+
     with st.expander("🧨 Breakout confirmation", expanded=False):
         signal_mode = st.radio(
             "Signal type",
@@ -548,20 +590,16 @@ with st.sidebar:
                 index=0,
                 key="engine_ui",
             )
-            engine_arg = "hybrid" if engine_ui.startswith("Hybrid") else ("box" if engine_ui.startswith("Box") else "squeeze")
         else:
-            engine_arg = None
+            engine_ui = "Hybrid (recommended)"
             st.info("Engine controls not available in your strategy.py.")
 
-        box_width_pct_max = None
         if _HAS_BOX_WIDTH:
             box_width_pct_max = st.slider("Max box width (%)", 0.3, 3.0, 1.2, 0.1, key="box_width") / 100.0
 
-        require_di_confirmation = None
         if _HAS_DI:
             require_di_confirmation = st.checkbox("Require DI confirmation", value=True, key="di_confirm")
 
-        rsi_floor_short = rsi_ceiling_long = None
         if _HAS_RSI_FLOOR:
             rsi_floor_short = st.slider("Block SHORT if RSI below", 10.0, 45.0, 30.0, 1.0, key="rsi_floor_short")
             rsi_ceiling_long = st.slider("Block LONG if RSI above", 55.0, 90.0, 70.0, 1.0, key="rsi_ceiling_long")
@@ -657,26 +695,33 @@ use_setup_col = "setup" if st.session_state.get("signal_mode", "✅").startswith
 ws_15m, ws_15m_err = get_signals_worksheet(SIGNAL_SHEET_15M)
 ws_daily, ws_daily_err = get_signals_worksheet(SIGNAL_SHEET_DAILY)
 
-colA, colB = st.columns(2)
-with colA:
+top_row = st.columns([2, 2, 3])
+with top_row[0]:
     st.write("**15M Sheet**")
     if ws_15m_err:
         st.error(ws_15m_err)
     else:
         st.success("Connected ✅")
-with colB:
+with top_row[1]:
     st.write("**Daily Sheet**")
     if ws_daily_err:
         st.error(ws_daily_err)
     else:
         st.success("Connected ✅")
+with top_row[2]:
+    st.write("**Display**")
+    st.caption("Quality filter + de-dup are in the sidebar. Keep the rest hidden until you need it.")
 
-df_recent_15m = pd.DataFrame() if ws_15m_err or not ws_15m else load_recent_signals(ws_15m, st.session_state["retention_hours"], "15M", audit_mode=st.session_state["audit_mode"])
-df_recent_daily = pd.DataFrame() if ws_daily_err or not ws_daily else load_recent_signals(ws_daily, st.session_state["retention_hours"], "Daily", audit_mode=st.session_state["audit_mode"])
+df_recent_15m = pd.DataFrame() if ws_15m_err or not ws_15m else load_recent_signals(
+    ws_15m, st.session_state["retention_hours"], "15M", audit_mode=st.session_state["audit_mode"]
+)
+df_recent_daily = pd.DataFrame() if ws_daily_err or not ws_daily else load_recent_signals(
+    ws_daily, st.session_state["retention_hours"], "Daily", audit_mode=st.session_state["audit_mode"]
+)
 
 st.subheader("🧠 Recent Signals (Market-Aware)")
 
-q_pref = st.selectbox("Show quality", ["A only", "A + B", "A + B + C"], index=0, key="quality_pref")
+q_pref = st.session_state.get("quality_pref", "A only")
 
 def _filter_quality(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty or "Quality" not in df.columns:
@@ -694,13 +739,13 @@ c1, c2 = st.columns(2)
 with c1:
     st.markdown("### 15M")
     if dfA_15m is not None and not dfA_15m.empty:
-        st.dataframe(dfA_15m, width="stretch")
+        st.dataframe(dfA_15m, use_container_width=True)
     else:
         st.info("No signals in window.")
 with c2:
-    st.markdown("### Daily (all 50 scanned)")
+    st.markdown("### Daily")
     if dfA_daily is not None and not dfA_daily.empty:
-        st.dataframe(dfA_daily, width="stretch")
+        st.dataframe(dfA_daily, use_container_width=True)
     else:
         st.info("No signals in window.")
 
@@ -710,10 +755,10 @@ st.divider()
 # =========================
 # Scan + logging
 # =========================
-st.subheader("🔎 Scan & Log (runs every refresh)")
-smart_retention_15m = get_market_aware_window(st.session_state["retention_hours"])
-smart_retention_daily = get_market_aware_window(st.session_state["retention_hours"], "Daily")
-st.caption(f"Window: ~{smart_retention_15m} trading-hours (15M) | ~{smart_retention_daily/24:.0f} trading-days (Daily)")
+with st.expander("🔎 Scan & Log (runs every refresh)", expanded=False):
+    smart_retention_15m = get_market_aware_window(st.session_state["retention_hours"])
+    smart_retention_daily = get_market_aware_window(st.session_state["retention_hours"], "Daily")
+    st.caption(f"Window: ~{smart_retention_15m} trading-hours (15M) | ~{smart_retention_daily/24:.0f} trading-days (Daily)")
 
 existing_keys_15m = fetch_existing_keys_recent(ws_15m, days_back=3) if ws_15m and not ws_15m_err else set()
 existing_keys_daily = fetch_existing_keys_recent(ws_daily, days_back=7) if ws_daily and not ws_daily_err else set()
@@ -745,20 +790,18 @@ def build_kwargs(is_daily: bool):
     )
 
     if _HAS_ENGINE:
-        kwargs["engine"] = st.session_state.get("engine_arg_override", None) or ("hybrid")
-        # Map engine_ui -> engine string
         engine_ui = st.session_state.get("engine_ui", "Hybrid (recommended)")
         kwargs["engine"] = "hybrid" if engine_ui.startswith("Hybrid") else ("box" if engine_ui.startswith("Box") else "squeeze")
 
-    if _HAS_BOX_WIDTH and st.session_state.get("box_width", None) is not None:
-        kwargs["box_width_pct_max"] = st.session_state["box_width"]
+    if _HAS_BOX_WIDTH and "box_width" in st.session_state:
+        kwargs["box_width_pct_max"] = float(st.session_state["box_width"])
 
-    if _HAS_DI and st.session_state.get("di_confirm", None) is not None:
-        kwargs["require_di_confirmation"] = st.session_state["di_confirm"]
+    if _HAS_DI and "di_confirm" in st.session_state:
+        kwargs["require_di_confirmation"] = bool(st.session_state["di_confirm"])
 
     if _HAS_RSI_FLOOR:
-        kwargs["rsi_floor_short"] = st.session_state.get("rsi_floor_short", 30.0)
-        kwargs["rsi_ceiling_long"] = st.session_state.get("rsi_ceiling_long", 70.0)
+        kwargs["rsi_floor_short"] = float(st.session_state.get("rsi_floor_short", 30.0))
+        kwargs["rsi_ceiling_long"] = float(st.session_state.get("rsi_ceiling_long", 70.0))
 
     return kwargs
 
@@ -767,6 +810,7 @@ def build_kwargs(is_daily: bool):
 for symbol in stock_list:
     try:
         df = get_ohlc_15min(symbol, days_back=15)
+        df = normalize_ohlc_index_to_ist(df)  # ✅ FIX: IST index
         if df is None or df.shape[0] < 220:
             continue
 
@@ -776,7 +820,7 @@ for symbol in stock_list:
         recent = recent[recent[use_setup_col] != ""]
 
         for candle_ts, r in recent.iterrows():
-            signal_time = ts_to_sheet_str(candle_ts, "15min")
+            signal_time = ts_to_sheet_str(candle_ts, "15min")  # candle_ts is now IST-naive
             setup = r[use_setup_col]
             trend = r.get("trend", "")
             ltp = float(r.get("close", np.nan))
@@ -798,7 +842,7 @@ for symbol in stock_list:
                 existing_keys_15m.add(key)
 
     except Exception as e:
-        if st.session_state["show_debug"]:
+        if st.session_state.get("show_debug", False):
             st.warning(f"{symbol} 15M error: {e}")
         continue
 
@@ -807,6 +851,7 @@ for symbol in stock_list:
 for symbol in stock_list:
     try:
         df_daily = get_ohlc_daily(symbol, lookback_days=252)
+        df_daily = normalize_ohlc_index_to_ist(df_daily)  # ✅ FIX: IST index
         if df_daily is None or df_daily.shape[0] < 100:
             continue
 
@@ -816,7 +861,8 @@ for symbol in stock_list:
         recent_daily = recent_daily[recent_daily[use_setup_col] != ""]
 
         for candle_ts, r in recent_daily.iterrows():
-            signal_time = to_ist(pd.Timestamp(candle_ts)).floor("1D").strftime("%Y-%m-%d")
+            # candle_ts is now IST-naive midnight for daily; keep it stable
+            signal_time = pd.Timestamp(candle_ts).strftime("%Y-%m-%d")
             setup = r[use_setup_col]
             trend = r.get("trend", "")
             ltp = float(r.get("close", np.nan))
@@ -838,25 +884,25 @@ for symbol in stock_list:
                 existing_keys_daily.add(key)
 
     except Exception as e:
-        if st.session_state["show_debug"]:
+        if st.session_state.get("show_debug", False):
             st.warning(f"{symbol} Daily error: {e}")
         continue
 
 
 appended_15m = appended_daily = 0
 if ws_15m and not ws_15m_err:
-    appended_15m, _ = append_signals(ws_15m, rows_15m, st.session_state["show_debug"])
+    appended_15m, _ = append_signals(ws_15m, rows_15m, st.session_state.get("show_debug", False))
 if ws_daily and not ws_daily_err:
-    appended_daily, _ = append_signals(ws_daily, rows_daily, st.session_state["show_debug"])
+    appended_daily, _ = append_signals(ws_daily, rows_daily, st.session_state.get("show_debug", False))
 
 st.caption(f"Logged **{appended_15m}** new 15M + **{appended_daily}** Daily signals.")
 
 
 # =========================
-# Backtest (compact + unique keys)
+# Backtest (kept compact)
 # =========================
 with st.expander("📜 Backtest (optional)", expanded=False):
-    st.caption("Backtest is optional UI. Keep it collapsed while scanning live.")
+    st.caption("Backtest is optional. Keep it collapsed while scanning live.")
 
     def run_backtest_15m(symbols, days_back=30, params=None):
         if params is None:
@@ -873,6 +919,7 @@ with st.expander("📜 Backtest (optional)", expanded=False):
         for symbol in symbols[:10]:
             try:
                 df = get_ohlc_15min(symbol, days_back=days_back)
+                df = normalize_ohlc_index_to_ist(df)  # ✅ FIX: IST index
                 if df is None or len(df) < 100:
                     continue
 
@@ -937,8 +984,8 @@ with st.expander("📜 Backtest (optional)", expanded=False):
 
         if not bt_results.empty:
             st.success(f"✅ Backtest complete: {len(bt_results)} signals across {total_bars:,} bars")
-            st.dataframe(bt_results, width="stretch")
+            st.dataframe(bt_results, use_container_width=True)
         else:
             st.warning("No signals found in selected period.")
 
-st.caption("✅ FYERS-powered: Token-sheet login + live scan + breakout confirmation + cleaner UI.")
+st.caption("✅ FYERS-powered: Token-sheet login + live scan + breakout confirmation + cleaner UI + IST-correct candles.")
