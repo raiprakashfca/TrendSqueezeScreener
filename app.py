@@ -1070,6 +1070,3 @@ with st.expander("🔎 Scan & Log (runs every refresh)", expanded=True):
             st.toast(f"✅ Logged {appended_15m + appended_daily} new signals!")
 
 st.caption("✅ FYERS-powered: token-sheet login + IST-correct OHLC + closed-candle guard + IST-only sheet logging + safe repair UI + Parallel Scan.")
-
-```
-
