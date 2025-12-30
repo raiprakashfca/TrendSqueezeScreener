@@ -1,6 +1,4 @@
-Here is the fully functional `app.py`. I have restored all original features (including the full repair logic and the Google Sheet-based login flow) while integrating the performance improvements (parallel scanning and batch writing).
 
-```python
 # app.py
 from __future__ import annotations
 
@@ -1074,3 +1072,4 @@ with st.expander("🔎 Scan & Log (runs every refresh)", expanded=True):
 st.caption("✅ FYERS-powered: token-sheet login + IST-correct OHLC + closed-candle guard + IST-only sheet logging + safe repair UI + Parallel Scan.")
 
 ```
+
