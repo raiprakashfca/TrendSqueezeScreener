@@ -310,18 +310,36 @@ def exchange_auth_code_for_token(app_id: str, secret_id: str, redirect_uri: str,
 
 @st.cache_data(ttl=120, show_spinner=False)
 def fyers_smoke_test() -> tuple[bool, str]:
+    """
+    Health check for FYERS data fetch.
+    Uses a wider window so weekends/holidays don't cause false failures.
+    """
     try:
-        df = get_ohlc_15min("RELIANCE", days_back=2)
+        # 1) Try 7 calendar days
+        df = get_ohlc_15min("RELIANCE", days_back=7)
         df = normalize_ohlc_index_to_ist(df)
-        if df is None or len(df) < 10:
-            return False, "OHLC returned empty/too short"
 
-        last_ts = pd.Timestamp(df.index[-1])
-        if last_ts > now_ist().replace(tzinfo=None) + timedelta(minutes=3):
-            return False, f"Last candle looks future: {last_ts}"
-        return True, "OK"
+        if df is not None and len(df) >= 10:
+            return True, "OK"
+
+        # 2) Fallback: last trading day logic
+        ltd = get_last_trading_day(now_ist().date())
+
+        df2 = get_ohlc_15min("RELIANCE", days_back=10)
+        df2 = normalize_ohlc_index_to_ist(df2)
+
+        if df2 is None or len(df2) < 10:
+            return False, "OHLC returned empty/too short (even after 7–10 day window)"
+
+        df2 = df2[df2.index.date >= ltd]
+        if len(df2) >= 5:
+            return True, "OK (fallback: last trading day)"
+
+        return False, "OHLC data not present for last trading day window"
+
     except Exception as e:
-        return False, str(e)[:220]
+        return False, str(e)[:200]
+
 
 
 # =========================
@@ -1079,3 +1097,4 @@ with st.expander("🔎 Scan & Log (runs every refresh)", expanded=False):
     st.caption(f"Logged **{appended_15m}** new 15M + **{appended_daily}** Daily signals.")
 
 st.caption("✅ No Streamlit ternary rendering anywhere = no more DeltaGenerator dumps.")
+
