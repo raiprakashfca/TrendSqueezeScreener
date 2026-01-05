@@ -37,7 +37,7 @@ IST = ZoneInfo("Asia/Kolkata")
 MARKET_OPEN = time(9, 15)
 MARKET_CLOSE = time(15, 30)
 
-# Used for "non-IST detector" window for 15M timestamps (slightly wider)
+# “non-IST detector” tolerance window
 MARKET_OPEN_TOL = time(9, 0)
 MARKET_CLOSE_TOL = time(15, 45)
 
@@ -105,7 +105,7 @@ def _safe_parse_dt(val) -> pd.Timestamp | None:
 def to_ist_naive_assume_ist_if_naive(ts) -> pd.Timestamp:
     """
     Convert tz-aware to IST-naive.
-    If tz-naive: assume it's already IST-naive (IMPORTANT for sheet timestamps).
+    If tz-naive: assume already IST-naive (IMPORTANT for sheet timestamps).
     """
     t = pd.Timestamp(ts)
     if t.tzinfo is None:
@@ -120,12 +120,12 @@ def ts_to_sheet_str(ts, freq: str = "15min") -> str:
 
 def normalize_ohlc_index_to_ist(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Fixes timezone issues WITHOUT creating 'future candles'.
+    Fix timezone issues WITHOUT creating 'future candles'.
 
     - tz-aware index -> convert to IST-naive
     - tz-naive index -> try UTC->IST
-        if UTC->IST pushes last candle into the future beyond a small tolerance,
-        then assume the input was already IST-naive and keep as-is.
+        if UTC->IST pushes last candle into future beyond tolerance,
+        assume input already IST-naive and keep as-is.
     """
     if df is None or df.empty:
         return df
@@ -155,8 +155,7 @@ def normalize_ohlc_index_to_ist(df: pd.DataFrame) -> pd.DataFrame:
         now_local = now_ist().replace(tzinfo=None)
         tol = timedelta(minutes=3)
         if last_conv > now_local + tol:
-            # already IST-naive, don't shift
-            out.index = idx.tz_localize(None)
+            out.index = idx.tz_localize(None)  # already IST-naive
         else:
             out.index = idx_utc_to_ist
     except Exception:
@@ -191,7 +190,7 @@ def get_gspread_client():
 
 
 # =========================
-# FYERS Token Sheet Manager (Login inside app)
+# FYERS Token Sheet Manager
 # =========================
 def get_fyers_token_worksheet():
     sheet_key = st.secrets.get("FYERS_TOKEN_SHEET_KEY", None)
@@ -580,13 +579,13 @@ def repair_sheet_timestamps(ws, timeframe: str = "15M", dry_run: bool = True, ma
 
             res["candidates"] += 1
 
+            # naive shift +5:30 (one-time correction heuristic)
             fixed_dt = (pd.Timestamp(dt) + pd.Timedelta(hours=5, minutes=30)).to_pydatetime()
             if timeframe.upper().startswith("15"):
                 new_sig = fixed_dt.strftime("%Y-%m-%d %H:%M")
             else:
                 new_sig = fixed_dt.strftime("%Y-%m-%d")
 
-            # patch key's signal_time segment if key is pipe-delimited
             new_key = key_raw
             parts = key_raw.split("|")
             if len(parts) >= 6:
@@ -629,7 +628,7 @@ _HAS_DI = "require_di_confirmation" in _STRAT_SIG.parameters
 
 
 # =========================
-# Sidebar: FYERS login + controls (inside app)
+# Sidebar: FYERS login + controls
 # =========================
 with st.sidebar:
     st.header("🔐 FYERS Login")
@@ -663,7 +662,6 @@ with st.sidebar:
         st.caption("Login → copy `auth_code` from redirected URL → paste below.")
     except Exception as e:
         st.error(f"Login URL failed: {e}")
-        login_url = None
 
     auth_code = st.text_input("2) Paste auth_code", value="", key="auth_code_input")
 
@@ -684,11 +682,11 @@ with st.sidebar:
     st.divider()
 
     st.subheader("⚙️ View settings")
-    show_debug = st.checkbox("Show debug", value=False, key="show_debug")
-    audit_mode = st.checkbox("Audit mode (no de-dup)", value=False, key="audit_mode")
-    retention_hours = st.slider("Retention (hours)", 6, 48, 24, 6, key="retention_hours")
+    st.checkbox("Show debug", value=False, key="show_debug")
+    st.checkbox("Audit mode (no de-dup)", value=False, key="audit_mode")
+    st.slider("Retention (hours)", 6, 48, 24, 6, key="retention_hours")
 
-    quality_pref = st.radio(
+    st.radio(
         "Show quality",
         ["A only", "A + B", "A + B + C"],
         index=0,
@@ -697,16 +695,16 @@ with st.sidebar:
     )
 
     with st.expander("🧨 Breakout confirmation", expanded=False):
-        signal_mode = st.radio(
+        st.radio(
             "Signal type",
             ["✅ Breakout Confirmed (trade)", "🟡 Setup Forming (watchlist)"],
             index=0,
             key="signal_mode",
         )
-        breakout_lookback = st.slider("Consolidation lookback (candles)", 10, 60, 20, 5, key="breakout_lookback")
-        require_bbw_expansion = st.checkbox("Require BBW expansion", value=True, key="require_bbw_expansion")
-        require_volume_spike = st.checkbox("Require volume spike", value=False, key="require_volume_spike")
-        volume_spike_mult = st.slider("Volume spike mult", 1.0, 3.0, 1.5, 0.1, key="volume_spike_mult")
+        st.slider("Consolidation lookback (candles)", 10, 60, 20, 5, key="breakout_lookback")
+        st.checkbox("Require BBW expansion", value=True, key="require_bbw_expansion")
+        st.checkbox("Require volume spike", value=False, key="require_volume_spike")
+        st.slider("Volume spike mult", 1.0, 3.0, 1.5, 0.1, key="volume_spike_mult")
 
     with st.expander("🧩 Engine controls", expanded=False):
         if _HAS_ENGINE:
@@ -814,7 +812,7 @@ use_setup_col = "setup" if st.session_state.get("signal_mode", "✅").startswith
 
 
 # =========================
-# Sheets connect (define BEFORE any UI uses them) ✅ fixes NameError
+# Sheets connect (define BEFORE any UI uses them)
 # =========================
 ws_15m, ws_15m_err = get_signals_worksheet(SIGNAL_SHEET_15M)
 ws_daily, ws_daily_err = get_signals_worksheet(SIGNAL_SHEET_DAILY)
@@ -824,7 +822,7 @@ ws_daily, ws_daily_err = get_signals_worksheet(SIGNAL_SHEET_DAILY)
 # Repair UI
 # =========================
 with st.expander("🧹 One-time repair: convert non-IST timestamps in Sheets", expanded=False):
-    st.warning("This will EDIT existing rows. Take a copy first if you care about history 📦")
+    st.warning("This will EDIT existing rows. Take a backup first 📦")
     dry = st.checkbox("Dry run (report only, no writing)", value=True, key="repair_dry_run")
 
     cA, cB = st.columns(2)
@@ -857,27 +855,44 @@ with st.expander("🧹 One-time repair: convert non-IST timestamps in Sheets", e
 
 
 # =========================
-# Recent Signals (clean UI)
+# Recent Signals (clean UI — NO ternary rendering)
 # =========================
 top_row = st.columns([2, 2, 3])
+
 with top_row[0]:
     st.write("**15M Sheet**")
-    st.success("Connected ✅") if not ws_15m_err else st.error(ws_15m_err)
+    if ws_15m_err:
+        st.error(ws_15m_err)
+    else:
+        st.success("Connected ✅")
 
 with top_row[1]:
     st.write("**Daily Sheet**")
-    st.success("Connected ✅") if not ws_daily_err else st.error(ws_daily_err)
+    if ws_daily_err:
+        st.error(ws_daily_err)
+    else:
+        st.success("Connected ✅")
 
 with top_row[2]:
     st.write("**Display**")
-    st.caption("Quality filter + de-dup are in the sidebar. No random code dumps, promise 😈")
+    st.caption("Quality filter + de-dup are in the sidebar. No DeltaGenerator graffiti.")
 
 df_recent_15m = pd.DataFrame()
 df_recent_daily = pd.DataFrame()
 if not ws_15m_err and ws_15m:
-    df_recent_15m = load_recent_signals(ws_15m, st.session_state["retention_hours"], "15M", audit_mode=st.session_state["audit_mode"])
+    df_recent_15m = load_recent_signals(
+        ws_15m,
+        st.session_state["retention_hours"],
+        "15M",
+        audit_mode=st.session_state["audit_mode"],
+    )
 if not ws_daily_err and ws_daily:
-    df_recent_daily = load_recent_signals(ws_daily, st.session_state["retention_hours"], "Daily", audit_mode=st.session_state["audit_mode"])
+    df_recent_daily = load_recent_signals(
+        ws_daily,
+        st.session_state["retention_hours"],
+        "Daily",
+        audit_mode=st.session_state["audit_mode"],
+    )
 
 st.subheader("🧠 Recent Signals (Market-Aware)")
 
@@ -970,7 +985,6 @@ with st.expander("🔎 Scan & Log (runs every refresh)", expanded=False):
             if df is None or df.shape[0] < 220:
                 continue
 
-            # hard guard: never accept OHLC "from the future"
             if pd.Timestamp(df.index[-1]) > now_ist().replace(tzinfo=None) + timedelta(minutes=3):
                 if st.session_state.get("show_debug", False):
                     st.warning(f"{symbol}: OHLC last candle looks future, skipping.")
@@ -983,8 +997,6 @@ with st.expander("🔎 Scan & Log (runs every refresh)", expanded=False):
 
             for candle_ts, r in recent.iterrows():
                 signal_time = ts_to_sheet_str(candle_ts, "15min")
-
-                # don't log non-IST-like times
                 dt_sig = _safe_parse_dt(signal_time)
                 if dt_sig is not None and _looks_non_ist_15m(dt_sig):
                     continue
@@ -1057,7 +1069,8 @@ with st.expander("🔎 Scan & Log (runs every refresh)", expanded=False):
                 st.warning(f"{symbol} Daily error: {e}")
             continue
 
-    appended_15m = appended_daily = 0
+    appended_15m = 0
+    appended_daily = 0
     if ws_15m and not ws_15m_err:
         appended_15m, _ = append_signals(ws_15m, rows_15m, st.session_state.get("show_debug", False))
     if ws_daily and not ws_daily_err:
@@ -1065,95 +1078,4 @@ with st.expander("🔎 Scan & Log (runs every refresh)", expanded=False):
 
     st.caption(f"Logged **{appended_15m}** new 15M + **{appended_daily}** Daily signals.")
 
-
-# =========================
-# Backtest (optional)
-# =========================
-with st.expander("📜 Backtest (optional)", expanded=False):
-    st.caption("Backtest is optional. Keep it collapsed while scanning live.")
-
-    def run_backtest_15m(symbols, days_back=30, params=None):
-        if params is None:
-            params = {
-                "bbw_abs_threshold": 0.05,
-                "bbw_pct_threshold": 0.35,
-                "adx_threshold": 20.0,
-                "rsi_bull": 55.0,
-                "rsi_bear": 45.0,
-            }
-        trades = []
-        total_bars = 0
-
-        for symbol in symbols[:10]:
-            try:
-                df = get_ohlc_15min(symbol, days_back=days_back)
-                df = normalize_ohlc_index_to_ist(df)
-                if df is None or len(df) < 100:
-                    continue
-
-                kwargs = dict(
-                    bbw_abs_threshold=params["bbw_abs_threshold"],
-                    bbw_pct_threshold=params["bbw_pct_threshold"],
-                    adx_threshold=params["adx_threshold"],
-                    rsi_bull=params["rsi_bull"],
-                    rsi_bear=params["rsi_bear"],
-                    rolling_window=20,
-                    breakout_lookback=st.session_state["breakout_lookback"],
-                    require_bbw_expansion=st.session_state["require_bbw_expansion"],
-                    require_volume_spike=st.session_state["require_volume_spike"],
-                    volume_spike_mult=st.session_state["volume_spike_mult"],
-                )
-                if _HAS_ENGINE:
-                    engine_ui = st.session_state.get("engine_ui", "Hybrid (recommended)")
-                    kwargs["engine"] = "hybrid" if engine_ui.startswith("Hybrid") else ("box" if engine_ui.startswith("Box") else "squeeze")
-
-                df_prepped = prepare_trend_squeeze(df, **kwargs)
-                signals = df_prepped[df_prepped["setup"] != ""]
-                total_bars += len(df_prepped)
-
-                for ts, row in signals.iterrows():
-                    setup = str(row.get("setup", ""))
-                    bias = "LONG" if setup.startswith("Bullish") else "SHORT"
-                    entry = float(row.get("close", np.nan))
-                    trades.append({
-                        "Symbol": symbol,
-                        "Time": to_ist_naive_assume_ist_if_naive(ts).strftime("%d-%b-%Y %H:%M"),
-                        "Setup": setup,
-                        "Bias": bias,
-                        "Entry": entry,
-                        "BBW": float(row.get("bbw", np.nan)),
-                        "RSI": float(row.get("rsi", np.nan)),
-                        "ADX": float(row.get("adx", np.nan)),
-                        "Quality": compute_quality_score(row),
-                    })
-            except Exception:
-                continue
-
-        return pd.DataFrame(trades), total_bars
-
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        bt_days = st.slider("Days back", 10, 90, 30, step=5, key="bt_days")
-    with col2:
-        bt_symbols = st.slider("Symbols", 5, 20, 10, step=1, key="bt_symbols")
-    with col3:
-        bt_profile = st.selectbox("Profile", ["Normal", "Conservative", "Aggressive"], index=0, key="bt_profile")
-
-    if bt_profile == "Conservative":
-        bt_params = {"bbw_abs_threshold": 0.035, "bbw_pct_threshold": 0.25, "adx_threshold": 25.0, "rsi_bull": 60.0, "rsi_bear": 40.0}
-    elif bt_profile == "Aggressive":
-        bt_params = {"bbw_abs_threshold": 0.065, "bbw_pct_threshold": 0.45, "adx_threshold": 18.0, "rsi_bull": 52.0, "rsi_bear": 48.0}
-    else:
-        bt_params = {"bbw_abs_threshold": 0.05, "bbw_pct_threshold": 0.35, "adx_threshold": 20.0, "rsi_bull": 55.0, "rsi_bear": 45.0}
-
-    if st.button("🚀 Run Backtest", type="primary", key="run_backtest_btn"):
-        with st.spinner("Running backtest on FYERS data..."):
-            bt_results, total_bars = run_backtest_15m(stock_list[:bt_symbols], bt_days, bt_params)
-
-        if not bt_results.empty:
-            st.success(f"✅ Backtest complete: {len(bt_results)} signals across {total_bars:,} bars")
-            st.dataframe(bt_results, use_container_width=True)
-        else:
-            st.warning("No signals found in selected period.")
-
-st.caption("✅ FYERS login is back in-app (sidebar) + timestamps guarded + no UI garbage.")
+st.caption("✅ No Streamlit ternary rendering anywhere = no more DeltaGenerator dumps.")
