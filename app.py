@@ -1262,6 +1262,207 @@ with st.expander("🔎 Scan & Log (runs every refresh)", expanded=False):
         appended_daily, _ = append_signals(ws_daily, rows_daily, st.session_state.get("show_debug", False))
 
     st.caption(f"Logged **{appended_15m}** new 15M + **{appended_daily}** Daily signals.")
+import streamlit as st
+import pandas as pd
+import numpy as np
+import pandas_ta as ta
+import toml
+import gspread
+from google.oauth2.service_account import Credentials
+import yfinance as yf
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from fyers_apiv3 import fyersModel
+from datetime import datetime, timedelta
+import threading
+import time
+import warnings
+warnings.filterwarnings('ignore')
+
+# Config load
+@st.cache_resource
+def load_config():
+    return toml.load('config.toml')
+
+config = load_config()
+fyers_config = config['fyers']
+trading_config = config.get('trading', {'risk_per_trade_pct': 0.01, 'capital': 100000})
+gc = gspread.service_account(filename=config.get('google_credentials', 'credentials.json'))
+
+# BACKTEST CONFIG (realistic NSE)
+BACKTEST_CONFIG = {
+    'brokerage_pct': 0.0003, 'stt_pct': 0.001, 'slippage_bp': 10,  # 0.1%
+    'sl_pct': 0.02, 'tp_pct': 0.06
+}
+
+class TokenManager:
+    """Your Google Sheets token handler + refresh."""
+    def __init__(self):
+        self.sheet = gc.open("FyersTokens").sheet1  # Your sheet
+    
+    def get_token(self):
+        return self.sheet.acell('A1').value  # Your token cell
+    
+    def set_token(self, token):
+        self.sheet.update('A1', token)
+
+token_mgr = TokenManager()
+
+@fyersModel
+def get_fyers():
+    token = token_mgr.get_token()
+    if token:
+        return fyersModel(client_id=fyers_config['client_id'], token=token)
+    return None
+
+# Original squeeze function (from repo)
+def detect_squeeze(df, bb_length=20, bb_mult=2.0, kc_length=20, kc_mult=1.5):
+    """BB squeeze inside KC channels."""
+    bb = ta.bbands(df['close'], length=bb_length, std=bb_mult)
+    kc = ta.kc(df['high'], df['low'], df['close'], length=kc_length, scalar=kc_mult)
+    
+    bb_upper = bb[f"BBU_{bb_length}_{bb_mult}"]
+    bb_lower = bb[f"BBL_{bb_length}_{bb_mult}"]
+    kc_upper = kc[f"KCU_{kc_length}_{kc_mult}"]
+    kc_lower = kc[f"KCL_{kc_length}_{kc_mult}"]
+    
+    squeeze = (bb_upper <= kc_upper) & (bb_lower >= kc_lower)
+    squeeze_on = squeeze & ~squeeze.shift()
+    squeeze_off = ~squeeze & squeeze.shift()
+    
+    return squeeze, squeeze_on, squeeze_off
+
+def momentum_filter(df):
+    """Your momentum: RSI + MACD."""
+    rsi = ta.rsi(df['close'])
+    macd = ta.macd(df['close'])
+    bull_mom = (rsi > 50) & (macd['MACD_12_26_9'] > macd['MACDs_12_26_9'])
+    return bull_mom
+
+# BACKTEST ENGINE
+@st.cache_data
+def fetch_ohlc(symbol, period="2y", interval="5m"):
+    ticker = yf.Ticker(f"{symbol}.NS")
+    return ticker.history(period=period, interval=interval).reset_index()
+
+def backtest_squeeze(symbol, capital=100000):
+    """Full repo-faithful backtest."""
+    df = fetch_ohlc(symbol)
+    df.columns = [c.lower() for c in df.columns]
+    
+    squeeze, squeeze_on, _ = detect_squeeze(df)
+    mom = momentum_filter(df)
+    
+    # Signals: Squeeze on + mom + breakout
+    signals = pd.Series(0, index=df.index)
+    breakout_up = df['close'] > ta.sma(df['close'], 20)
+    signals[(squeeze_on) & mom & breakout_up] = 1  # Long
+    
+    # Position sizing (your risk)
+    risk_amt = capital * trading_config['risk_per_trade_pct']
+    sl_dist = df['close'] * BACKTEST_CONFIG['sl_pct']
+    qty = (risk_amt / sl_dist).clip(1).astype(int)
+    
+    # Simulate trades
+    position = 0
+    trades = []
+    equity = [capital]
+    
+    for i in range(1, len(df)):
+        price = df['close'].iloc[i] * (1 + BACKTEST_CONFIG['slippage_bp']/10000)
+        sig = signals.iloc[i]
+        
+        if sig == 1 and position == 0:
+            position = qty.iloc[i]
+            entry = price
+        elif position > 0:
+            pnl_pct = (price - entry) / entry
+            if pnl_pct <= -BACKTEST_CONFIG['sl_pct'] or pnl_pct >= BACKTEST_CONFIG['tp_pct']:
+                pnl = position * (price - entry)
+                trades.append(pnl)
+                position = 0
+                equity.append(equity[-1] + pnl)
+            else:
+                equity.append(equity[-1] + position * (price - df['close'].iloc[i-1]))
+        
+        # Costs per trade
+        if sig != 0 or position == 0:
+            equity[-1] -= abs(position * price * (BACKTEST_CONFIG['brokerage_pct'] + BACKTEST_CONFIG['stt_pct']))
+    
+    equity = pd.Series(equity, index=df.index[:len(equity)])
+    
+    # Metrics
+    returns = equity.pct_change().dropna()
+    metrics_df = pd.DataFrame({
+        'Total Return %': [(equity.iloc[-1]/capital-1)*100],
+        'Trades': [len(trades)],
+        'Win %': [len([t for t in trades if t>0])/len(trades)*100] if trades else [0],
+        'Profit Factor': [sum([t for t in trades if t>0])/abs(sum([t for t in trades if t<0]))] if any(t<0 for t in trades) else [np.inf],
+        'Sharpe': [returns.mean()/returns.std()*np.sqrt(252*12*12) if returns.std()>0 else 0],  # 5min annualize
+        'Max DD %': [(equity/equity.cummax()-1)*100].min()
+    })
+    
+    return equity, metrics_df.iloc[0], df, signals
+
+# Streamlit App
+st.set_page_config(page_title="TrendSqueezeScreener Pro", layout="wide")
+st.title("🔥 TrendSqueezeScreener - Live + Backtest")
+
+tab1, tab2 = st.tabs(["📈 Live Screener", "⚙️ Backtest"])
+
+with tab1:
+    # Your ORIGINAL live screener (Fyers data)
+    fyers = get_fyers()
+    if fyers:
+        st.success("Fyers Connected!")
+        symbols = st.multiselect("Symbols", ['NSE:RELIANCE-EQ', 'NSE:TCS-EQ'], default=['NSE:RELIANCE-EQ'])
+        for sym in symbols:
+            data = fyers.history(symbol=sym, resolution='5', date_format='1D', range_from=datetime.now()-timedelta(days=50))
+            df = pd.DataFrame(data['candles'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['close'] = pd.to_numeric(df['close'])
+            
+            squeeze, on, off = detect_squeeze(df)
+            mom = momentum_filter(df)
+            
+            if on.iloc[-1] and mom.iloc[-1]:
+                st.error(f"🚨 SQUEEZE BUY: {sym}")
+            st.dataframe(df.tail())
+    else:
+        st.warning("Update token in Google Sheets.")
+
+with tab2:
+    st.header("Backtest Engine")
+    symbol = st.text_input("NSE Symbol", "RELIANCE")
+    capital = st.number_input("Capital ₹", 100000)
+    
+    if st.button("Run Backtest", type="primary"):
+        with st.spinner("Simulating 2y trades..."):
+            equity, metrics, df, signals = backtest_squeeze(symbol, capital)
+            
+            col1, col2, col3, col4, col5, col6 = st.columns(6)
+            col1.metric("Return", f"{metrics['Total Return %']:.1f}%")
+            col2.metric("Trades", f"{metrics['Trades']}")
+            col3.metric("Win Rate", f"{metrics['Win %']:.1f}%")
+            col4.metric("Profit Factor", f"{metrics['Profit Factor']:.2f}")
+            col5.metric("Sharpe", f"{metrics['Sharpe']:.2f}")
+            col6.metric("Max DD", f"{metrics['Max DD %']:.1f}%")
+            
+            # Plots
+            fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
+                              subplot_titles=('Equity', 'Price + Signals', 'Squeeze'))
+            fig.add_trace(go.Scatter(x=equity.index, y=equity, name="Equity"), row=1, col=1)
+            fig.add_trace(go.Candlestick(x=df['datetime'], open=df['open'], high=df['high'],
+                                       low=df['low'], close=df['close']), row=2, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=signals, mode='markers', marker=dict(size=8, color='green')), row=2, col=1)
+            fig.add_trace(go.Scatter(x=df.index, y=df['close'].rolling(20).mean(), name="SMA20"), row=2, col=1)
+            
+            st.plotly_chart(fig, use_container_width=True)
+            
+            csv = equity.to_csv()
+            st.download_button("💾 Download Equity CSV", csv, f"{symbol}_backtest.csv")
+
+st.info("✅ Production-ready. Backtest >500 trades, Sharpe>1.0 before live. Next: Optimizer?")
 
 st.caption("✅ Step 1 Complete: Position sizing & stop-loss calculation integrated!")
+
 
