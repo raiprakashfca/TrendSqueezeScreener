@@ -1,7 +1,7 @@
 # app.py
 from __future__ import annotations
 
-from datetime import datetime, time, timedelta
+from datetime import datetime, time as dtime, timedelta
 from zoneinfo import ZoneInfo
 import json
 import inspect
@@ -10,9 +10,6 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
-from utils.zerodha_utils
-
-from utils.risk_calculator import add_risk_metrics_to_signal
 
 import gspread
 from gspread.exceptions import SpreadsheetNotFound, APIError
@@ -20,6 +17,7 @@ from oauth2client.service_account import ServiceAccountCredentials
 
 from fyers_apiv3 import fyersModel
 
+from utils.risk_calculator import add_risk_metrics_to_signal
 from utils.zerodha_utils import (
     init_fyers_session,
     get_ohlc_15min,
@@ -27,29 +25,29 @@ from utils.zerodha_utils import (
     is_trading_day,
     get_last_trading_day,
 )
-
 from utils.strategy import prepare_trend_squeeze
 
+
 # =========================
-# Streamlit config
+# Streamlit config (ONLY ONCE)
 # =========================
 st.set_page_config(page_title="📉 Trend Squeeze Screener", layout="wide")
 st_autorefresh(interval=300000, key="auto_refresh")  # 5 min refresh
 
 IST = ZoneInfo("Asia/Kolkata")
-MARKET_OPEN = time(9, 15)
-MARKET_CLOSE = time(15, 30)
+MARKET_OPEN = dtime(9, 15)
+MARKET_CLOSE = dtime(15, 30)
 
 # "non-IST detector" tolerance window
-MARKET_OPEN_TOL = time(9, 0)
-MARKET_CLOSE_TOL = time(15, 45)
+MARKET_OPEN_TOL = dtime(9, 0)
+MARKET_CLOSE_TOL = dtime(15, 45)
 
 SIGNAL_SHEET_15M = "TrendSqueezeSignals_15M"
 SIGNAL_SHEET_DAILY = "TrendSqueezeSignals_Daily"
 
 # Direct Sheet IDs (signals logs)
-SHEET_ID_15M = "1RP2tbh6WnMgEDAv5FWXD6GhePXno9bZ81ILFyoX6Fb8"
-SHEET_ID_DAILY = "1u-W5vu3KM6XPRr78o8yyK8pPaAjRUIFEEYKHyYGUsM0"
+SHEET_ID_15M = st.secrets.get("SHEET_ID_15M", "1RP2tbh6WnMgEDAv5FWXD6GhePXno9bZ81ILFyoX6Fb8")
+SHEET_ID_DAILY = st.secrets.get("SHEET_ID_DAILY", "1u-W5vu3KM6XPRr78o8yyK8pPaAjRUIFEEYKHyYGUsM0")
 
 SIGNAL_COLUMNS = [
     "key",
@@ -68,7 +66,7 @@ SIGNAL_COLUMNS = [
     "trend",
     "quality_score",
     "params_hash",
-    # NEW: Risk management columns
+    # Risk management columns
     "atr",
     "stop_loss",
     "stop_method",
@@ -103,7 +101,6 @@ def market_open_now() -> bool:
 
 
 def fmt_dt(dt: datetime) -> str:
-    # store as tz-naive string, but it is IST context
     return dt.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
 
 
@@ -119,8 +116,8 @@ def _safe_parse_dt(val) -> pd.Timestamp | None:
 
 def to_ist_naive_assume_ist_if_naive(ts) -> pd.Timestamp:
     """
-    Convert tz-aware to IST-naive.
-    If tz-naive: assume already IST-naive (IMPORTANT for sheet timestamps).
+    tz-aware -> IST-naive
+    tz-naive -> assume already IST-naive (Sheet timestamps)
     """
     t = pd.Timestamp(ts)
     if t.tzinfo is None:
@@ -138,9 +135,7 @@ def normalize_ohlc_index_to_ist(df: pd.DataFrame) -> pd.DataFrame:
     Fix timezone issues WITHOUT creating 'future candles'.
 
     - tz-aware index -> convert to IST-naive
-    - tz-naive index -> try UTC->IST
-        if UTC->IST pushes last candle into future beyond tolerance,
-        assume input already IST-naive and keep as-is.
+    - tz-naive index -> try UTC->IST; if that creates future candles, treat as already IST-naive
     """
     if df is None or df.empty:
         return df
@@ -150,7 +145,6 @@ def normalize_ohlc_index_to_ist(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     idx = out.index
 
-    # tz-aware -> safe convert
     if getattr(idx, "tz", None) is not None:
         try:
             out.index = idx.tz_convert("Asia/Kolkata").tz_localize(None)
@@ -158,18 +152,15 @@ def normalize_ohlc_index_to_ist(df: pd.DataFrame) -> pd.DataFrame:
             pass
         return out
 
-    # tz-naive -> attempt UTC->IST conversion
     try:
         idx_utc_to_ist = idx.tz_localize("UTC").tz_convert("Asia/Kolkata").tz_localize(None)
     except Exception:
         return out
 
-    # future-check heuristic
     try:
         last_conv = pd.Timestamp(idx_utc_to_ist[-1])
         now_local = now_ist().replace(tzinfo=None)
-        tol = timedelta(minutes=3)
-        if last_conv > now_local + tol:
+        if last_conv > now_local + timedelta(minutes=3):
             out.index = idx.tz_localize(None)  # already IST-naive
         else:
             out.index = idx_utc_to_ist
@@ -282,12 +273,10 @@ def ensure_fyers_row_exists(ws):
 
 def update_fyers_token(ws, token: str, timestamp: str):
     header = [h.strip() for h in ws.row_values(1)]
-    if "fyers_access_token" not in header:
-        header.append("fyers_access_token")
-        ws.update(values=[header], range_name="A1")
-    if "fyers_token_updated_at" not in header:
-        header.append("fyers_token_updated_at")
-        ws.update(values=[header], range_name="A1")
+    for col in ["fyers_access_token", "fyers_token_updated_at"]:
+        if col not in header:
+            header.append(col)
+            ws.update(values=[header], range_name="A1")
 
     col_token = header.index("fyers_access_token") + 1
     col_ts = header.index("fyers_token_updated_at") + 1
@@ -325,33 +314,12 @@ def exchange_auth_code_for_token(app_id: str, secret_id: str, redirect_uri: str,
 
 @st.cache_data(ttl=120, show_spinner=False)
 def fyers_smoke_test() -> tuple[bool, str]:
-    """
-    Health check for FYERS data fetch.
-    Uses a wider window so weekends/holidays don't cause false failures.
-    """
     try:
-        # 1) Try 7 calendar days
         df = get_ohlc_15min("RELIANCE", days_back=7)
         df = normalize_ohlc_index_to_ist(df)
-
         if df is not None and len(df) >= 10:
             return True, "OK"
-
-        # 2) Fallback: last trading day logic
-        ltd = get_last_trading_day(now_ist().date())
-
-        df2 = get_ohlc_15min("RELIANCE", days_back=10)
-        df2 = normalize_ohlc_index_to_ist(df2)
-
-        if df2 is None or len(df2) < 10:
-            return False, "OHLC returned empty/too short (even after 7–10 day window)"
-
-        df2 = df2[df2.index.date >= ltd]
-        if len(df2) >= 5:
-            return True, "OK (fallback: last trading day)"
-
-        return False, "OHLC data not present for last trading day window"
-
+        return False, "OHLC returned empty/too short"
     except Exception as e:
         return False, str(e)[:200]
 
@@ -381,20 +349,18 @@ def get_signals_worksheet(sheet_name: str):
     except Exception as e:
         return None, f"Failed to access sheet1: {e}"
 
+    # Enforce headers (order matters because we append rows in this order)
     try:
         header = ws.row_values(1)
-        if not header:
-            ws.append_row(SIGNAL_COLUMNS)
-        else:
-            if len(header) < len(SIGNAL_COLUMNS):
-                ws.update(values=[SIGNAL_COLUMNS], range_name="A1")
+        if header != SIGNAL_COLUMNS:
+            ws.update(values=[SIGNAL_COLUMNS], range_name="A1")
     except Exception as e:
         return None, f"Failed to ensure headers: {e}"
 
     return ws, None
 
 
-def fetch_existing_keys_recent(ws, days_back: int = 3) -> set:
+def fetch_existing_keys_recent(ws, days_back: int = 3) -> set[str]:
     try:
         records = ws.get_all_records()
     except Exception:
@@ -431,7 +397,7 @@ def params_to_hash(bbw_abs, bbw_pct, adx, rsi_bull, rsi_bear):
     return f"{bbw_abs:.3f}|{bbw_pct:.2f}|{adx:.1f}|{rsi_bull:.1f}|{rsi_bear:.1f}"
 
 
-def compute_quality_score(row):
+def compute_quality_score(row: pd.Series) -> str:
     score = 0
     adx_val = row.get("adx", np.nan)
     if pd.notna(adx_val):
@@ -457,7 +423,7 @@ def compute_quality_score(row):
 
     if score >= 4:
         return "A"
-    elif score >= 2:
+    if score >= 2:
         return "B"
     return "C"
 
@@ -517,7 +483,6 @@ def load_recent_signals(ws, base_hours: int = 24, timeframe: str = "15M", audit_
             "adx": "ADX",
             "trend": "Trend",
             "quality_score": "Quality",
-            # NEW columns
             "stop_loss": "Stop",
             "shares": "Qty",
             "position_value": "Position ₹",
@@ -530,11 +495,10 @@ def load_recent_signals(ws, base_hours: int = 24, timeframe: str = "15M", audit_
     if not audit_mode:
         df = df.drop_duplicates(subset=["Symbol", "Timeframe"], keep="first")
 
-    # Update display columns
     cols = [
         "Timestamp", "Symbol", "Timeframe", "Quality", "Bias", "Setup",
         "LTP", "Stop", "Qty", "Position ₹", "Target 2R",
-        "BBW", "BBW %Rank", "RSI", "ADX", "Trend"
+        "BBW", "BBW %Rank", "RSI", "ADX", "Trend",
     ]
     for c in cols:
         if c not in df.columns:
@@ -557,15 +521,7 @@ def _looks_non_ist_15m(dt_naive: pd.Timestamp) -> bool:
 
 
 def repair_sheet_timestamps(ws, timeframe: str = "15M", dry_run: bool = True, max_rows: int = 5000) -> dict:
-    res = {
-        "rows_total": 0,
-        "rows_scanned": 0,
-        "candidates": 0,
-        "updated": 0,
-        "skipped": 0,
-        "errors": 0,
-        "notes": [],
-    }
+    res = {"rows_total": 0, "rows_scanned": 0, "candidates": 0, "updated": 0, "skipped": 0, "errors": 0, "notes": []}
 
     try:
         values = ws.get_all_values()
@@ -590,14 +546,12 @@ def repair_sheet_timestamps(ws, timeframe: str = "15M", dry_run: bool = True, ma
     rows = values[1 : 1 + max_rows]
     res["rows_scanned"] = len(rows)
 
-    updates = []  # (row_idx, new_signal, new_key)
-
+    updates = []
     for i, row in enumerate(rows, start=2):
         try:
             if len(row) <= max(col_signal, col_key):
                 res["skipped"] += 1
                 continue
-
             sig_raw = (row[col_signal] or "").strip()
             key_raw = (row[col_key] or "").strip()
             if not sig_raw or not key_raw:
@@ -609,24 +563,13 @@ def repair_sheet_timestamps(ws, timeframe: str = "15M", dry_run: bool = True, ma
                 res["skipped"] += 1
                 continue
 
-            needs_fix = False
-            if timeframe.upper().startswith("15"):
-                needs_fix = _looks_non_ist_15m(dt)
-            else:
-                if pd.Timestamp(dt).date() > now_ist().date():
-                    needs_fix = True
-
+            needs_fix = _looks_non_ist_15m(dt) if timeframe.upper().startswith("15") else (pd.Timestamp(dt).date() > now_ist().date())
             if not needs_fix:
                 continue
 
             res["candidates"] += 1
-
-            # naive shift +5:30 (one-time correction heuristic)
             fixed_dt = (pd.Timestamp(dt) + pd.Timedelta(hours=5, minutes=30)).to_pydatetime()
-            if timeframe.upper().startswith("15"):
-                new_sig = fixed_dt.strftime("%Y-%m-%d %H:%M")
-            else:
-                new_sig = fixed_dt.strftime("%Y-%m-%d")
+            new_sig = fixed_dt.strftime("%Y-%m-%d %H:%M") if timeframe.upper().startswith("15") else fixed_dt.strftime("%Y-%m-%d")
 
             new_key = key_raw
             parts = key_raw.split("|")
@@ -679,20 +622,18 @@ with st.sidebar:
     if ws_fyers_err:
         st.error("FYERS token sheet ❌")
         st.caption(ws_fyers_err)
-        app_id_sheet = secret_id_sheet = token_sheet = updated_at_sheet = ""
+        st.stop()
+
+    app_id_sheet, secret_id_sheet, token_sheet, updated_at_sheet = read_fyers_row(ws_fyers)
+
+    if token_sheet:
+        st.success("Token found ✅")
     else:
-        app_id_sheet, secret_id_sheet, token_sheet, updated_at_sheet = read_fyers_row(ws_fyers)
-        if token_sheet:
-            st.success("Token found ✅")
-        else:
-            st.warning("No access token yet ❗")
-        if updated_at_sheet:
-            st.caption(f"Last updated: {updated_at_sheet}")
+        st.warning("No access token yet ❗")
+    if updated_at_sheet:
+        st.caption(f"Last updated: {updated_at_sheet}")
 
     redirect_uri = st.secrets.get("FYERS_REDIRECT_URI", "https://trade.fyers.in/api-login/redirect-uri/index.html")
-
-    if ws_fyers_err:
-        st.stop()
 
     if not app_id_sheet or not secret_id_sheet:
         st.error("Fill fyers_app_id and fyers_secret_id in FYERS token sheet row 2.")
@@ -706,7 +647,6 @@ with st.sidebar:
         st.error(f"Login URL failed: {e}")
 
     auth_code = st.text_input("2) Paste auth_code", value="", key="auth_code_input")
-
     if st.button("3) Exchange & Save Token", type="primary", key="exchange_save_btn"):
         if not auth_code.strip():
             st.error("Paste auth_code first.")
@@ -722,27 +662,15 @@ with st.sidebar:
                 st.error(f"Token exchange failed: {e}")
 
     st.divider()
-
     st.subheader("⚙️ View settings")
     st.checkbox("Show debug", value=False, key="show_debug")
     st.checkbox("Audit mode (no de-dup)", value=False, key="audit_mode")
     st.slider("Retention (hours)", 6, 48, 24, 6, key="retention_hours")
 
-    st.radio(
-        "Show quality",
-        ["A only", "A + B", "A + B + C"],
-        index=0,
-        key="quality_pref",
-        horizontal=True,
-    )
+    st.radio("Show quality", ["A only", "A + B", "A + B + C"], index=0, key="quality_pref", horizontal=True)
 
     with st.expander("🧨 Breakout confirmation", expanded=False):
-        st.radio(
-            "Signal type",
-            ["✅ Breakout Confirmed (trade)", "🟡 Setup Forming (watchlist)"],
-            index=0,
-            key="signal_mode",
-        )
+        st.radio("Signal type", ["✅ Breakout Confirmed (trade)", "🟡 Setup Forming (watchlist)"], index=0, key="signal_mode")
         st.slider("Consolidation lookback (candles)", 10, 60, 20, 5, key="breakout_lookback")
         st.checkbox("Require BBW expansion", value=True, key="require_bbw_expansion")
         st.checkbox("Require volume spike", value=False, key="require_volume_spike")
@@ -750,12 +678,7 @@ with st.sidebar:
 
     with st.expander("🧩 Engine controls", expanded=False):
         if _HAS_ENGINE:
-            st.selectbox(
-                "Engine",
-                ["Hybrid (recommended)", "Box Breakout (range)", "Squeeze Breakout (TTM)"],
-                index=0,
-                key="engine_ui",
-            )
+            st.selectbox("Engine", ["Hybrid (recommended)", "Box Breakout (range)", "Squeeze Breakout (TTM)"], index=0, key="engine_ui")
         else:
             st.info("Engine controls not available in your strategy.py.")
 
@@ -771,7 +694,6 @@ with st.sidebar:
 
     with st.expander("📈 Threshold profiles", expanded=False):
         param_profile = st.selectbox("Profile", ["Normal", "Conservative", "Aggressive"], index=0, key="param_profile")
-
         if param_profile == "Conservative":
             bbw_abs_default, bbw_pct_default = 0.035, 0.25
             adx_default, rsi_bull_default, rsi_bear_default = 25.0, 60.0, 40.0
@@ -790,36 +712,11 @@ with st.sidebar:
 
     st.slider("15M catch-up candles", 8, 64, 32, 4, key="catchup_candles_15m")
 
-    # NEW: Risk Management Controls
     st.divider()
     st.subheader("💰 Risk Management")
-    account_capital = st.number_input(
-        "Account Capital (₹)",
-        min_value=10000.0,
-        max_value=100000000.0,
-        value=1000000.0,  # Default 10 lakhs
-        step=50000.0,
-        key="account_capital",
-        help="Your total trading capital in rupees"
-    )
-    risk_per_trade = st.slider(
-        "Risk Per Trade (%)",
-        min_value=0.5,
-        max_value=2.0,
-        value=1.0,
-        step=0.1,
-        key="risk_per_trade",
-        help="Percentage of capital you're willing to risk on one trade. 1% is recommended."
-    )
-    atr_multiplier = st.slider(
-        "ATR Multiplier for Stop",
-        min_value=1.5,
-        max_value=3.0,
-        value=2.0,
-        step=0.5,
-        key="atr_multiplier",
-        help="How many ATRs away to place stop-loss. 2.0 is standard."
-    )
+    st.number_input("Account Capital (₹)", min_value=10000.0, max_value=100000000.0, value=1000000.0, step=50000.0, key="account_capital")
+    st.slider("Risk Per Trade (%)", min_value=0.5, max_value=2.0, value=1.0, step=0.1, key="risk_per_trade")
+    st.slider("ATR Multiplier for Stop", min_value=1.5, max_value=3.0, value=2.0, step=0.5, key="atr_multiplier")
 
 
 # =========================
@@ -881,11 +778,11 @@ stock_list = [
 ]
 st.caption(f"Universe: NIFTY50 ({len(stock_list)} symbols).")
 
-use_setup_col = "setup" if st.session_state.get("signal_mode", "✅").startswith("✅") else "setup_forming"
+use_setup_col_local = "setup" if st.session_state.get("signal_mode", "✅").startswith("✅") else "setup_forming"
 
 
 # =========================
-# Sheets connect (define BEFORE any UI uses them)
+# Sheets connect
 # =========================
 ws_15m, ws_15m_err = get_signals_worksheet(SIGNAL_SHEET_15M)
 ws_daily, ws_daily_err = get_signals_worksheet(SIGNAL_SHEET_DAILY)
@@ -897,20 +794,6 @@ ws_daily, ws_daily_err = get_signals_worksheet(SIGNAL_SHEET_DAILY)
 with st.expander("🧹 One-time repair: convert non-IST timestamps in Sheets", expanded=False):
     st.warning("This will EDIT existing rows. Take a backup first 📦")
     dry = st.checkbox("Dry run (report only, no writing)", value=True, key="repair_dry_run")
-
-    cA, cB = st.columns(2)
-    with cA:
-        st.write("**15M sheet**")
-        if ws_15m_err:
-            st.error(ws_15m_err)
-        else:
-            st.success("Ready ✅")
-    with cB:
-        st.write("**Daily sheet**")
-        if ws_daily_err:
-            st.error(ws_daily_err)
-        else:
-            st.success("Ready ✅")
 
     if st.button("Run repair now", type="primary", key="run_repair"):
         if ws_15m_err or ws_daily_err:
@@ -928,44 +811,25 @@ with st.expander("🧹 One-time repair: convert non-IST timestamps in Sheets", e
 
 
 # =========================
-# Recent Signals (clean UI — NO ternary rendering)
+# Recent Signals UI
 # =========================
 top_row = st.columns([2, 2, 3])
-
 with top_row[0]:
     st.write("**15M Sheet**")
+    st.success("Connected ✅" if not ws_15m_err else "Not connected ❌")
     if ws_15m_err:
-        st.error(ws_15m_err)
-    else:
-        st.success("Connected ✅")
-
+        st.caption(ws_15m_err)
 with top_row[1]:
     st.write("**Daily Sheet**")
+    st.success("Connected ✅" if not ws_daily_err else "Not connected ❌")
     if ws_daily_err:
-        st.error(ws_daily_err)
-    else:
-        st.success("Connected ✅")
-
+        st.caption(ws_daily_err)
 with top_row[2]:
     st.write("**Display**")
-    st.caption("Quality filter + de-dup are in the sidebar. No DeltaGenerator graffiti.")
+    st.caption("Quality filter + de-dup are in the sidebar.")
 
-df_recent_15m = pd.DataFrame()
-df_recent_daily = pd.DataFrame()
-if not ws_15m_err and ws_15m:
-    df_recent_15m = load_recent_signals(
-        ws_15m,
-        st.session_state["retention_hours"],
-        "15M",
-        audit_mode=st.session_state["audit_mode"],
-    )
-if not ws_daily_err and ws_daily:
-    df_recent_daily = load_recent_signals(
-        ws_daily,
-        st.session_state["retention_hours"],
-        "Daily",
-        audit_mode=st.session_state["audit_mode"],
-    )
+df_recent_15m = load_recent_signals(ws_15m, st.session_state["retention_hours"], "15M", audit_mode=st.session_state["audit_mode"]) if ws_15m and not ws_15m_err else pd.DataFrame()
+df_recent_daily = load_recent_signals(ws_daily, st.session_state["retention_hours"], "Daily", audit_mode=st.session_state["audit_mode"]) if ws_daily and not ws_daily_err else pd.DataFrame()
 
 st.subheader("🧠 Recent Signals (Market-Aware)")
 
@@ -980,22 +844,15 @@ def _filter_quality(df: pd.DataFrame) -> pd.DataFrame:
         return df[df["Quality"].isin(["A", "B"])].copy()
     return df
 
-dfA_15m = _filter_quality(df_recent_15m)
-dfA_daily = _filter_quality(df_recent_daily)
-
 c1, c2 = st.columns(2)
 with c1:
     st.markdown("### 15M")
-    if dfA_15m is not None and not dfA_15m.empty:
-        st.dataframe(dfA_15m, use_container_width=True)
-    else:
-        st.info("No signals in window.")
+    dfA_15m = _filter_quality(df_recent_15m)
+    st.dataframe(dfA_15m, use_container_width=True) if not dfA_15m.empty else st.info("No signals in window.")
 with c2:
     st.markdown("### Daily")
-    if dfA_daily is not None and not dfA_daily.empty:
-        st.dataframe(dfA_daily, use_container_width=True)
-    else:
-        st.info("No signals in window.")
+    dfA_daily = _filter_quality(df_recent_daily)
+    st.dataframe(dfA_daily, use_container_width=True) if not dfA_daily.empty else st.info("No signals in window.")
 
 st.divider()
 
@@ -1048,13 +905,10 @@ with st.expander("🔎 Scan & Log (runs every refresh)", expanded=False):
 
         return kwargs
 
-    use_setup_col_local = "setup" if st.session_state.get("signal_mode", "✅").startswith("✅") else "setup_forming"
-
     # 15M scan
     for symbol in stock_list:
         try:
-            df = get_ohlc_15min(symbol, days_back=15)
-            df = normalize_ohlc_index_to_ist(df)
+            df = normalize_ohlc_index_to_ist(get_ohlc_15min(symbol, days_back=15))
             if df is None or df.shape[0] < 220:
                 continue
 
@@ -1085,70 +939,41 @@ with st.expander("🔎 Scan & Log (runs every refresh)", expanded=False):
                 bias = "LONG" if str(setup).startswith("Bullish") else "SHORT"
                 key = f"{symbol}|15M|Continuation|{signal_time}|{setup}|{bias}"
 
-                if key not in existing_keys_15m:
-                    quality = compute_quality_score(r)
+                if key in existing_keys_15m:
+                    continue
 
-                    # NEW: Create signal dictionary
-                    signal_dict = {
-                        "key": key,
-                        "signal_time": signal_time,
-                        "logged_at": logged_at,
-                        "symbol": symbol,
-                        "timeframe": "15M",
-                        "mode": "Continuation",
-                        "setup": setup,
-                        "bias": bias,
-                        "ltp": ltp,
-                        "bbw": bbw,
-                        "bbw_pct_rank": bbw_rank,
-                        "rsi": rsi_val,
-                        "adx": adx_val,
-                        "trend": trend,
-                        "quality_score": quality,
-                        "params_hash": params_hash,
-                    }
+                quality = compute_quality_score(r)
 
-                    # NEW: Add risk metrics
-                    enhanced_signal = add_risk_metrics_to_signal(
-                        signal_row=signal_dict,
-                        df_ohlc=df,
-                        account_capital=st.session_state.get("account_capital", 1000000.0),
-                        risk_per_trade_pct=st.session_state.get("risk_per_trade", 1.0),
-                        atr_multiplier=st.session_state.get("atr_multiplier", 2.0),
-                        lookback_swing=20
-                    )
+                signal_dict = {
+                    "key": key,
+                    "signal_time": signal_time,
+                    "logged_at": logged_at,
+                    "symbol": symbol,
+                    "timeframe": "15M",
+                    "mode": "Continuation",
+                    "setup": setup,
+                    "bias": bias,
+                    "ltp": ltp,
+                    "bbw": bbw,
+                    "bbw_pct_rank": bbw_rank,
+                    "rsi": rsi_val,
+                    "adx": adx_val,
+                    "trend": trend,
+                    "quality_score": quality,
+                    "params_hash": params_hash,
+                }
 
-                    # Convert to row format for sheets
-                    rows_15m.append([
-                        enhanced_signal.get("key"),
-                        enhanced_signal.get("signal_time"),
-                        enhanced_signal.get("logged_at"),
-                        enhanced_signal.get("symbol"),
-                        enhanced_signal.get("timeframe"),
-                        enhanced_signal.get("mode"),
-                        enhanced_signal.get("setup"),
-                        enhanced_signal.get("bias"),
-                        enhanced_signal.get("ltp"),
-                        enhanced_signal.get("bbw"),
-                        enhanced_signal.get("bbw_pct_rank"),
-                        enhanced_signal.get("rsi"),
-                        enhanced_signal.get("adx"),
-                        enhanced_signal.get("trend"),
-                        enhanced_signal.get("quality_score"),
-                        enhanced_signal.get("params_hash"),
-                        enhanced_signal.get("atr"),
-                        enhanced_signal.get("stop_loss"),
-                        enhanced_signal.get("stop_method"),
-                        enhanced_signal.get("shares"),
-                        enhanced_signal.get("position_value"),
-                        enhanced_signal.get("rupee_risk"),
-                        enhanced_signal.get("risk_pct"),
-                        enhanced_signal.get("risk_per_share"),
-                        enhanced_signal.get("target_1.5R"),
-                        enhanced_signal.get("target_2R"),
-                        enhanced_signal.get("target_3R"),
-                    ])
-                    existing_keys_15m.add(key)
+                enhanced_signal = add_risk_metrics_to_signal(
+                    signal_row=signal_dict,
+                    df_ohlc=df,
+                    account_capital=st.session_state.get("account_capital", 1000000.0),
+                    risk_per_trade_pct=st.session_state.get("risk_per_trade", 1.0),
+                    atr_multiplier=st.session_state.get("atr_multiplier", 2.0),
+                    lookback_swing=20,
+                )
+
+                rows_15m.append([enhanced_signal.get(c) for c in SIGNAL_COLUMNS])
+                existing_keys_15m.add(key)
 
         except Exception as e:
             if st.session_state.get("show_debug", False):
@@ -1158,8 +983,7 @@ with st.expander("🔎 Scan & Log (runs every refresh)", expanded=False):
     # Daily scan
     for symbol in stock_list:
         try:
-            df_daily = get_ohlc_daily(symbol, lookback_days=252)
-            df_daily = normalize_ohlc_index_to_ist(df_daily)
+            df_daily = normalize_ohlc_index_to_ist(get_ohlc_daily(symbol, lookback_days=252))
             if df_daily is None or df_daily.shape[0] < 100:
                 continue
 
@@ -1184,285 +1008,55 @@ with st.expander("🔎 Scan & Log (runs every refresh)", expanded=False):
                 bias = "LONG" if str(setup).startswith("Bullish") else "SHORT"
                 key = f"{symbol}|Daily|Continuation|{signal_time}|{setup}|{bias}"
 
-                if key not in existing_keys_daily:
-                    quality = compute_quality_score(r)
+                if key in existing_keys_daily:
+                    continue
 
-                    # NEW: Create signal dictionary
-                    signal_dict = {
-                        "key": key,
-                        "signal_time": signal_time,
-                        "logged_at": logged_at,
-                        "symbol": symbol,
-                        "timeframe": "Daily",
-                        "mode": "Continuation",
-                        "setup": setup,
-                        "bias": bias,
-                        "ltp": ltp,
-                        "bbw": bbw,
-                        "bbw_pct_rank": bbw_rank,
-                        "rsi": rsi_val,
-                        "adx": adx_val,
-                        "trend": trend,
-                        "quality_score": quality,
-                        "params_hash": params_hash,
-                    }
+                quality = compute_quality_score(r)
 
-                    # NEW: Add risk metrics
-                    enhanced_signal = add_risk_metrics_to_signal(
-                        signal_row=signal_dict,
-                        df_ohlc=df_daily,
-                        account_capital=st.session_state.get("account_capital", 1000000.0),
-                        risk_per_trade_pct=st.session_state.get("risk_per_trade", 1.0),
-                        atr_multiplier=st.session_state.get("atr_multiplier", 2.0),
-                        lookback_swing=20
-                    )
+                signal_dict = {
+                    "key": key,
+                    "signal_time": signal_time,
+                    "logged_at": logged_at,
+                    "symbol": symbol,
+                    "timeframe": "Daily",
+                    "mode": "Continuation",
+                    "setup": setup,
+                    "bias": bias,
+                    "ltp": ltp,
+                    "bbw": bbw,
+                    "bbw_pct_rank": bbw_rank,
+                    "rsi": rsi_val,
+                    "adx": adx_val,
+                    "trend": trend,
+                    "quality_score": quality,
+                    "params_hash": params_hash,
+                }
 
-                    # Convert to row format for sheets
-                    rows_daily.append([
-                        enhanced_signal.get("key"),
-                        enhanced_signal.get("signal_time"),
-                        enhanced_signal.get("logged_at"),
-                        enhanced_signal.get("symbol"),
-                        enhanced_signal.get("timeframe"),
-                        enhanced_signal.get("mode"),
-                        enhanced_signal.get("setup"),
-                        enhanced_signal.get("bias"),
-                        enhanced_signal.get("ltp"),
-                        enhanced_signal.get("bbw"),
-                        enhanced_signal.get("bbw_pct_rank"),
-                        enhanced_signal.get("rsi"),
-                        enhanced_signal.get("adx"),
-                        enhanced_signal.get("trend"),
-                        enhanced_signal.get("quality_score"),
-                        enhanced_signal.get("params_hash"),
-                        enhanced_signal.get("atr"),
-                        enhanced_signal.get("stop_loss"),
-                        enhanced_signal.get("stop_method"),
-                        enhanced_signal.get("shares"),
-                        enhanced_signal.get("position_value"),
-                        enhanced_signal.get("rupee_risk"),
-                        enhanced_signal.get("risk_pct"),
-                        enhanced_signal.get("risk_per_share"),
-                        enhanced_signal.get("target_1.5R"),
-                        enhanced_signal.get("target_2R"),
-                        enhanced_signal.get("target_3R"),
-                    ])
-                    existing_keys_daily.add(key)
+                enhanced_signal = add_risk_metrics_to_signal(
+                    signal_row=signal_dict,
+                    df_ohlc=df_daily,
+                    account_capital=st.session_state.get("account_capital", 1000000.0),
+                    risk_per_trade_pct=st.session_state.get("risk_per_trade", 1.0),
+                    atr_multiplier=st.session_state.get("atr_multiplier", 2.0),
+                    lookback_swing=20,
+                )
+
+                rows_daily.append([enhanced_signal.get(c) for c in SIGNAL_COLUMNS])
+                existing_keys_daily.add(key)
 
         except Exception as e:
             if st.session_state.get("show_debug", False):
                 st.warning(f"{symbol} Daily error: {e}")
             continue
 
-    appended_15m = 0
-    appended_daily = 0
+    appended_15m = appended_daily = 0
+    err15 = errd = None
     if ws_15m and not ws_15m_err:
-        appended_15m, _ = append_signals(ws_15m, rows_15m, st.session_state.get("show_debug", False))
+        appended_15m, err15 = append_signals(ws_15m, rows_15m, st.session_state.get("show_debug", False))
     if ws_daily and not ws_daily_err:
-        appended_daily, _ = append_signals(ws_daily, rows_daily, st.session_state.get("show_debug", False))
+        appended_daily, errd = append_signals(ws_daily, rows_daily, st.session_state.get("show_debug", False))
+
+    if err15 or errd:
+        st.error(f"Logging errors: 15M={err15} | Daily={errd}")
 
     st.caption(f"Logged **{appended_15m}** new 15M + **{appended_daily}** Daily signals.")
-import streamlit as st
-import pandas as pd
-import numpy as np
-import pandas_ta as ta
-import toml
-import gspread
-from google.oauth2.service_account import Credentials
-import yfinance as yf
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from fyers_apiv3 import fyersModel
-from datetime import datetime, timedelta
-import threading
-import time
-import warnings
-warnings.filterwarnings('ignore')
-
-# Config load
-@st.cache_resource
-def load_config():
-    return toml.load('config.toml')
-
-config = load_config()
-fyers_config = config['fyers']
-trading_config = config.get('trading', {'risk_per_trade_pct': 0.01, 'capital': 100000})
-gc = gspread.service_account(filename=config.get('google_credentials', 'credentials.json'))
-
-# BACKTEST CONFIG (realistic NSE)
-BACKTEST_CONFIG = {
-    'brokerage_pct': 0.0003, 'stt_pct': 0.001, 'slippage_bp': 10,  # 0.1%
-    'sl_pct': 0.02, 'tp_pct': 0.06
-}
-
-class TokenManager:
-    """Your Google Sheets token handler + refresh."""
-    def __init__(self):
-        self.sheet = gc.open("FyersTokens").sheet1  # Your sheet
-    
-    def get_token(self):
-        return self.sheet.acell('A1').value  # Your token cell
-    
-    def set_token(self, token):
-        self.sheet.update('A1', token)
-
-token_mgr = TokenManager()
-
-@fyersModel
-def get_fyers():
-    token = token_mgr.get_token()
-    if token:
-        return fyersModel(client_id=fyers_config['client_id'], token=token)
-    return None
-
-# Original squeeze function (from repo)
-def detect_squeeze(df, bb_length=20, bb_mult=2.0, kc_length=20, kc_mult=1.5):
-    """BB squeeze inside KC channels."""
-    bb = ta.bbands(df['close'], length=bb_length, std=bb_mult)
-    kc = ta.kc(df['high'], df['low'], df['close'], length=kc_length, scalar=kc_mult)
-    
-    bb_upper = bb[f"BBU_{bb_length}_{bb_mult}"]
-    bb_lower = bb[f"BBL_{bb_length}_{bb_mult}"]
-    kc_upper = kc[f"KCU_{kc_length}_{kc_mult}"]
-    kc_lower = kc[f"KCL_{kc_length}_{kc_mult}"]
-    
-    squeeze = (bb_upper <= kc_upper) & (bb_lower >= kc_lower)
-    squeeze_on = squeeze & ~squeeze.shift()
-    squeeze_off = ~squeeze & squeeze.shift()
-    
-    return squeeze, squeeze_on, squeeze_off
-
-def momentum_filter(df):
-    """Your momentum: RSI + MACD."""
-    rsi = ta.rsi(df['close'])
-    macd = ta.macd(df['close'])
-    bull_mom = (rsi > 50) & (macd['MACD_12_26_9'] > macd['MACDs_12_26_9'])
-    return bull_mom
-
-# BACKTEST ENGINE
-@st.cache_data
-def fetch_ohlc(symbol, period="2y", interval="5m"):
-    ticker = yf.Ticker(f"{symbol}.NS")
-    return ticker.history(period=period, interval=interval).reset_index()
-
-def backtest_squeeze(symbol, capital=100000):
-    """Full repo-faithful backtest."""
-    df = fetch_ohlc(symbol)
-    df.columns = [c.lower() for c in df.columns]
-    
-    squeeze, squeeze_on, _ = detect_squeeze(df)
-    mom = momentum_filter(df)
-    
-    # Signals: Squeeze on + mom + breakout
-    signals = pd.Series(0, index=df.index)
-    breakout_up = df['close'] > ta.sma(df['close'], 20)
-    signals[(squeeze_on) & mom & breakout_up] = 1  # Long
-    
-    # Position sizing (your risk)
-    risk_amt = capital * trading_config['risk_per_trade_pct']
-    sl_dist = df['close'] * BACKTEST_CONFIG['sl_pct']
-    qty = (risk_amt / sl_dist).clip(1).astype(int)
-    
-    # Simulate trades
-    position = 0
-    trades = []
-    equity = [capital]
-    
-    for i in range(1, len(df)):
-        price = df['close'].iloc[i] * (1 + BACKTEST_CONFIG['slippage_bp']/10000)
-        sig = signals.iloc[i]
-        
-        if sig == 1 and position == 0:
-            position = qty.iloc[i]
-            entry = price
-        elif position > 0:
-            pnl_pct = (price - entry) / entry
-            if pnl_pct <= -BACKTEST_CONFIG['sl_pct'] or pnl_pct >= BACKTEST_CONFIG['tp_pct']:
-                pnl = position * (price - entry)
-                trades.append(pnl)
-                position = 0
-                equity.append(equity[-1] + pnl)
-            else:
-                equity.append(equity[-1] + position * (price - df['close'].iloc[i-1]))
-        
-        # Costs per trade
-        if sig != 0 or position == 0:
-            equity[-1] -= abs(position * price * (BACKTEST_CONFIG['brokerage_pct'] + BACKTEST_CONFIG['stt_pct']))
-    
-    equity = pd.Series(equity, index=df.index[:len(equity)])
-    
-    # Metrics
-    returns = equity.pct_change().dropna()
-    metrics_df = pd.DataFrame({
-        'Total Return %': [(equity.iloc[-1]/capital-1)*100],
-        'Trades': [len(trades)],
-        'Win %': [len([t for t in trades if t>0])/len(trades)*100] if trades else [0],
-        'Profit Factor': [sum([t for t in trades if t>0])/abs(sum([t for t in trades if t<0]))] if any(t<0 for t in trades) else [np.inf],
-        'Sharpe': [returns.mean()/returns.std()*np.sqrt(252*12*12) if returns.std()>0 else 0],  # 5min annualize
-        'Max DD %': [(equity/equity.cummax()-1)*100].min()
-    })
-    
-    return equity, metrics_df.iloc[0], df, signals
-
-# Streamlit App
-st.set_page_config(page_title="TrendSqueezeScreener Pro", layout="wide")
-st.title("🔥 TrendSqueezeScreener - Live + Backtest")
-
-tab1, tab2 = st.tabs(["📈 Live Screener", "⚙️ Backtest"])
-
-with tab1:
-    # Your ORIGINAL live screener (Fyers data)
-    fyers = get_fyers()
-    if fyers:
-        st.success("Fyers Connected!")
-        symbols = st.multiselect("Symbols", ['NSE:RELIANCE-EQ', 'NSE:TCS-EQ'], default=['NSE:RELIANCE-EQ'])
-        for sym in symbols:
-            data = fyers.history(symbol=sym, resolution='5', date_format='1D', range_from=datetime.now()-timedelta(days=50))
-            df = pd.DataFrame(data['candles'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-            df['close'] = pd.to_numeric(df['close'])
-            
-            squeeze, on, off = detect_squeeze(df)
-            mom = momentum_filter(df)
-            
-            if on.iloc[-1] and mom.iloc[-1]:
-                st.error(f"🚨 SQUEEZE BUY: {sym}")
-            st.dataframe(df.tail())
-    else:
-        st.warning("Update token in Google Sheets.")
-
-with tab2:
-    st.header("Backtest Engine")
-    symbol = st.text_input("NSE Symbol", "RELIANCE")
-    capital = st.number_input("Capital ₹", 100000)
-    
-    if st.button("Run Backtest", type="primary"):
-        with st.spinner("Simulating 2y trades..."):
-            equity, metrics, df, signals = backtest_squeeze(symbol, capital)
-            
-            col1, col2, col3, col4, col5, col6 = st.columns(6)
-            col1.metric("Return", f"{metrics['Total Return %']:.1f}%")
-            col2.metric("Trades", f"{metrics['Trades']}")
-            col3.metric("Win Rate", f"{metrics['Win %']:.1f}%")
-            col4.metric("Profit Factor", f"{metrics['Profit Factor']:.2f}")
-            col5.metric("Sharpe", f"{metrics['Sharpe']:.2f}")
-            col6.metric("Max DD", f"{metrics['Max DD %']:.1f}%")
-            
-            # Plots
-            fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
-                              subplot_titles=('Equity', 'Price + Signals', 'Squeeze'))
-            fig.add_trace(go.Scatter(x=equity.index, y=equity, name="Equity"), row=1, col=1)
-            fig.add_trace(go.Candlestick(x=df['datetime'], open=df['open'], high=df['high'],
-                                       low=df['low'], close=df['close']), row=2, col=1)
-            fig.add_trace(go.Scatter(x=df.index, y=signals, mode='markers', marker=dict(size=8, color='green')), row=2, col=1)
-            fig.add_trace(go.Scatter(x=df.index, y=df['close'].rolling(20).mean(), name="SMA20"), row=2, col=1)
-            
-            st.plotly_chart(fig, use_container_width=True)
-            
-            csv = equity.to_csv()
-            st.download_button("💾 Download Equity CSV", csv, f"{symbol}_backtest.csv")
-
-st.info("✅ Production-ready. Backtest >500 trades, Sharpe>1.0 before live. Next: Optimizer?")
-
-st.caption("✅ Step 1 Complete: Position sizing & stop-loss calculation integrated!")
-
-
