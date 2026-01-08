@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
+
 from utils.risk_calculator import add_risk_metrics_to_signal
 
 import gspread
@@ -25,8 +26,8 @@ from utils.zerodha_utils import (
     is_trading_day,
     get_last_trading_day,
 )
-from utils.strategy import prepare_trend_squeeze
 
+from utils.strategy import prepare_trend_squeeze
 
 # =========================
 # Streamlit config
@@ -38,7 +39,7 @@ IST = ZoneInfo("Asia/Kolkata")
 MARKET_OPEN = time(9, 15)
 MARKET_CLOSE = time(15, 30)
 
-# “non-IST detector” tolerance window
+# "non-IST detector" tolerance window
 MARKET_OPEN_TOL = time(9, 0)
 MARKET_CLOSE_TOL = time(15, 45)
 
@@ -79,7 +80,6 @@ SIGNAL_COLUMNS = [
     "target_2R",
     "target_3R",
 ]
-
 
 FYERS_TOKEN_HEADERS = [
     "fyers_app_id",
@@ -355,7 +355,6 @@ def fyers_smoke_test() -> tuple[bool, str]:
         return False, str(e)[:200]
 
 
-
 # =========================
 # Signals sheets (logging)
 # =========================
@@ -504,43 +503,40 @@ def load_recent_signals(ws, base_hours: int = 24, timeframe: str = "15M", audit_
     df["Timestamp"] = df["signal_time_dt"].dt.strftime("%d-%b-%Y %H:%M")
 
     df.rename(
-    columns={
-        "symbol": "Symbol",
-        "timeframe": "Timeframe",
-        "mode": "Mode",
-        "setup": "Setup",
-        "bias": "Bias",
-        "ltp": "LTP",
-        "bbw": "BBW",
-        "bbw_pct_rank": "BBW %Rank",
-        "rsi": "RSI",
-        "adx": "ADX",
-        "trend": "Trend",
-        "quality_score": "Quality",
-        # NEW columns
-        "stop_loss": "Stop",
-        "shares": "Qty",
-        "position_value": "Position ₹",
-        "target_2R": "Target 2R",
-    },
-    inplace=True,
-)
+        columns={
+            "symbol": "Symbol",
+            "timeframe": "Timeframe",
+            "mode": "Mode",
+            "setup": "Setup",
+            "bias": "Bias",
+            "ltp": "LTP",
+            "bbw": "BBW",
+            "bbw_pct_rank": "BBW %Rank",
+            "rsi": "RSI",
+            "adx": "ADX",
+            "trend": "Trend",
+            "quality_score": "Quality",
+            # NEW columns
+            "stop_loss": "Stop",
+            "shares": "Qty",
+            "position_value": "Position ₹",
+            "target_2R": "Target 2R",
+        },
+        inplace=True,
+    )
 
-# Update display columns
-cols = [
-    "Timestamp", "Symbol", "Timeframe", "Quality", "Bias", "Setup", 
-    "LTP", "Stop", "Qty", "Position ₹", "Target 2R",
-    "BBW", "BBW %Rank", "RSI", "ADX", "Trend"
-]
+    df = df.sort_values("signal_time_dt", ascending=False)
+    if not audit_mode:
+        df = df.drop_duplicates(subset=["Symbol", "Timeframe"], keep="first")
 
-
-        df = df.sort_values("signal_time_dt", ascending=False)
-            if not audit_mode:
-            df = df.drop_duplicates(subset=["Symbol", "Timeframe"], keep="first")
-
-        cols = ["Timestamp", "Symbol", "Timeframe", "Quality", "Bias", "Setup", "LTP", "BBW", "BBW %Rank", "RSI", "ADX", "Trend"]
-        for c in cols:
-           if c not in df.columns:
+    # Update display columns
+    cols = [
+        "Timestamp", "Symbol", "Timeframe", "Quality", "Bias", "Setup",
+        "LTP", "Stop", "Qty", "Position ₹", "Target 2R",
+        "BBW", "BBW %Rank", "RSI", "ADX", "Trend"
+    ]
+    for c in cols:
+        if c not in df.columns:
             df[c] = None
     return df[cols]
 
@@ -792,33 +788,37 @@ with st.sidebar:
         st.slider("RSI bear max", 30.0, 50.0, rsi_bear_default, 1.0, key="rsi_bear")
 
     st.slider("15M catch-up candles", 8, 64, 32, 4, key="catchup_candles_15m")
-# Add this in your sidebar, after the existing controls
-st.divider()
-st.subheader("💰 Risk Management")
-account_capital = st.number_input(
-    "Account Capital (₹)",
-    min_value=10000.0,
-    max_value=100000000.0,
-    value=1000000.0,  # Default 10 lakhs
-    step=50000.0,
-    help="Your total trading capital in rupees"
-)
-risk_per_trade = st.slider(
-    "Risk Per Trade (%)",
-    min_value=0.5,
-    max_value=2.0,
-    value=1.0,
-    step=0.1,
-    help="Percentage of capital you're willing to risk on one trade. 1% is recommended."
-)
-atr_multiplier = st.slider(
-    "ATR Multiplier for Stop",
-    min_value=1.5,
-    max_value=3.0,
-    value=2.0,
-    step=0.5,
-    help="How many ATRs away to place stop-loss. 2.0 is standard."
-)
+
+    # NEW: Risk Management Controls
+    st.divider()
+    st.subheader("💰 Risk Management")
+    account_capital = st.number_input(
+        "Account Capital (₹)",
+        min_value=10000.0,
+        max_value=100000000.0,
+        value=1000000.0,  # Default 10 lakhs
+        step=50000.0,
+        key="account_capital",
+        help="Your total trading capital in rupees"
+    )
+    risk_per_trade = st.slider(
+        "Risk Per Trade (%)",
+        min_value=0.5,
+        max_value=2.0,
+        value=1.0,
+        step=0.1,
+        key="risk_per_trade",
+        help="Percentage of capital you're willing to risk on one trade. 1% is recommended."
+    )
+    atr_multiplier = st.slider(
+        "ATR Multiplier for Stop",
+        min_value=1.5,
+        max_value=3.0,
+        value=2.0,
+        step=0.5,
+        key="atr_multiplier",
+        help="How many ATRs away to place stop-loss. 2.0 is standard."
+    )
 
 
 # =========================
@@ -875,395 +875,4 @@ stock_list = [
     "ADANIENT","ADANIPORTS","APOLLOHOSP","ASIANPAINT","AXISBANK","BAJAJ-AUTO","BAJFINANCE","BAJAJFINSV",
     "BHARTIARTL","BPCL","BRITANNIA","CIPLA","COALINDIA","DIVISLAB","DRREDDY","EICHERMOT","GRASIM","HCLTECH",
     "HDFCBANK","HINDALCO","HINDUNILVR","ICICIBANK","INDUSINDBK","INFY","ITC","JSWSTEEL","KOTAKBANK","LT","LTIM",
-    "M&M","MARUTI","NESTLEIND","NTPC","ONGC","POWERGRID","RELIANCE","SBIN","SBILIFE","SUNPHARMA","TATACONSUM",
-    "TATAMOTORS","TATASTEEL","TCS","TECHM","TITAN","ULTRACEMCO","UPL","WIPRO","HEROMOTOCO","SHREECEM"
-]
-st.caption(f"Universe: NIFTY50 ({len(stock_list)} symbols).")
-
-use_setup_col = "setup" if st.session_state.get("signal_mode", "✅").startswith("✅") else "setup_forming"
-
-
-# =========================
-# Sheets connect (define BEFORE any UI uses them)
-# =========================
-ws_15m, ws_15m_err = get_signals_worksheet(SIGNAL_SHEET_15M)
-ws_daily, ws_daily_err = get_signals_worksheet(SIGNAL_SHEET_DAILY)
-
-
-# =========================
-# Repair UI
-# =========================
-with st.expander("🧹 One-time repair: convert non-IST timestamps in Sheets", expanded=False):
-    st.warning("This will EDIT existing rows. Take a backup first 📦")
-    dry = st.checkbox("Dry run (report only, no writing)", value=True, key="repair_dry_run")
-
-    cA, cB = st.columns(2)
-    with cA:
-        st.write("**15M sheet**")
-        if ws_15m_err:
-            st.error(ws_15m_err)
-        else:
-            st.success("Ready ✅")
-    with cB:
-        st.write("**Daily sheet**")
-        if ws_daily_err:
-            st.error(ws_daily_err)
-        else:
-            st.success("Ready ✅")
-
-    if st.button("Run repair now", type="primary", key="run_repair"):
-        if ws_15m_err or ws_daily_err:
-            st.error("Fix sheet connectivity first.")
-        else:
-            with st.spinner("Repairing 15M sheet..."):
-                r15 = repair_sheet_timestamps(ws_15m, timeframe="15M", dry_run=dry)
-            with st.spinner("Repairing Daily sheet..."):
-                rd = repair_sheet_timestamps(ws_daily, timeframe="Daily", dry_run=dry)
-            st.success("Repair complete ✅")
-            st.json({"15M": r15, "Daily": rd})
-            if not dry:
-                st.cache_data.clear()
-                st.rerun()
-
-
-# =========================
-# Recent Signals (clean UI — NO ternary rendering)
-# =========================
-top_row = st.columns([2, 2, 3])
-
-with top_row[0]:
-    st.write("**15M Sheet**")
-    if ws_15m_err:
-        st.error(ws_15m_err)
-    else:
-        st.success("Connected ✅")
-
-with top_row[1]:
-    st.write("**Daily Sheet**")
-    if ws_daily_err:
-        st.error(ws_daily_err)
-    else:
-        st.success("Connected ✅")
-
-with top_row[2]:
-    st.write("**Display**")
-    st.caption("Quality filter + de-dup are in the sidebar. No DeltaGenerator graffiti.")
-
-df_recent_15m = pd.DataFrame()
-df_recent_daily = pd.DataFrame()
-if not ws_15m_err and ws_15m:
-    df_recent_15m = load_recent_signals(
-        ws_15m,
-        st.session_state["retention_hours"],
-        "15M",
-        audit_mode=st.session_state["audit_mode"],
-    )
-if not ws_daily_err and ws_daily:
-    df_recent_daily = load_recent_signals(
-        ws_daily,
-        st.session_state["retention_hours"],
-        "Daily",
-        audit_mode=st.session_state["audit_mode"],
-    )
-
-st.subheader("🧠 Recent Signals (Market-Aware)")
-
-q_pref = st.session_state.get("quality_pref", "A only")
-
-def _filter_quality(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty or "Quality" not in df.columns:
-        return df
-    if q_pref == "A only":
-        return df[df["Quality"] == "A"].copy()
-    if q_pref == "A + B":
-        return df[df["Quality"].isin(["A", "B"])].copy()
-    return df
-
-dfA_15m = _filter_quality(df_recent_15m)
-dfA_daily = _filter_quality(df_recent_daily)
-
-c1, c2 = st.columns(2)
-with c1:
-    st.markdown("### 15M")
-    if dfA_15m is not None and not dfA_15m.empty:
-        st.dataframe(dfA_15m, use_container_width=True)
-    else:
-        st.info("No signals in window.")
-with c2:
-    st.markdown("### Daily")
-    if dfA_daily is not None and not dfA_daily.empty:
-        st.dataframe(dfA_daily, use_container_width=True)
-    else:
-        st.info("No signals in window.")
-
-st.divider()
-
-
-# =========================
-# Scan + logging
-# =========================
-with st.expander("🔎 Scan & Log (runs every refresh)", expanded=False):
-    existing_keys_15m = fetch_existing_keys_recent(ws_15m, days_back=3) if ws_15m and not ws_15m_err else set()
-    existing_keys_daily = fetch_existing_keys_recent(ws_daily, days_back=7) if ws_daily and not ws_daily_err else set()
-
-    params_hash = params_to_hash(
-        st.session_state["bbw_abs_threshold"],
-        st.session_state["bbw_pct_threshold"],
-        st.session_state["adx_threshold"],
-        st.session_state["rsi_bull"],
-        st.session_state["rsi_bear"],
-    )
-
-    logged_at = fmt_dt(now_ist())
-    rows_15m, rows_daily = [], []
-
-    def build_kwargs(is_daily: bool):
-        kwargs = dict(
-            bbw_abs_threshold=st.session_state["bbw_abs_threshold"] * (1.2 if is_daily else 1.0),
-            bbw_pct_threshold=st.session_state["bbw_pct_threshold"],
-            adx_threshold=st.session_state["adx_threshold"],
-            rsi_bull=st.session_state["rsi_bull"],
-            rsi_bear=st.session_state["rsi_bear"],
-            rolling_window=20,
-            breakout_lookback=st.session_state["breakout_lookback"],
-            require_bbw_expansion=st.session_state["require_bbw_expansion"],
-            require_volume_spike=st.session_state["require_volume_spike"],
-            volume_spike_mult=st.session_state["volume_spike_mult"],
-        )
-
-        if _HAS_ENGINE:
-            engine_ui = st.session_state.get("engine_ui", "Hybrid (recommended)")
-            kwargs["engine"] = "hybrid" if engine_ui.startswith("Hybrid") else ("box" if engine_ui.startswith("Box") else "squeeze")
-
-        if _HAS_BOX_WIDTH and "box_width" in st.session_state:
-            kwargs["box_width_pct_max"] = float(st.session_state["box_width"]) / 100.0
-
-        if _HAS_DI and "di_confirm" in st.session_state:
-            kwargs["require_di_confirmation"] = bool(st.session_state["di_confirm"])
-
-        if _HAS_RSI_FLOOR:
-            kwargs["rsi_floor_short"] = float(st.session_state.get("rsi_floor_short", 30.0))
-            kwargs["rsi_ceiling_long"] = float(st.session_state.get("rsi_ceiling_long", 70.0))
-
-        return kwargs
-
-    use_setup_col_local = "setup" if st.session_state.get("signal_mode", "✅").startswith("✅") else "setup_forming"
-
-    # 15M scan
-    for symbol in stock_list:
-        try:
-            df = get_ohlc_15min(symbol, days_back=15)
-            df = normalize_ohlc_index_to_ist(df)
-            if df is None or df.shape[0] < 220:
-                continue
-
-            if pd.Timestamp(df.index[-1]) > now_ist().replace(tzinfo=None) + timedelta(minutes=3):
-                if st.session_state.get("show_debug", False):
-                    st.warning(f"{symbol}: OHLC last candle looks future, skipping.")
-                continue
-
-            df_prepped = prepare_trend_squeeze(df, **build_kwargs(is_daily=False))
-
-            recent = df_prepped.tail(int(st.session_state["catchup_candles_15m"])).copy()
-            recent = recent[recent[use_setup_col_local] != ""]
-
-            for candle_ts, r in recent.iterrows():
-                signal_time = ts_to_sheet_str(candle_ts, "15min")
-                dt_sig = _safe_parse_dt(signal_time)
-                if dt_sig is not None and _looks_non_ist_15m(dt_sig):
-                    continue
-
-                setup = r[use_setup_col_local]
-                trend = r.get("trend", "")
-                ltp = float(r.get("close", np.nan))
-                bbw = float(r.get("bbw", np.nan))
-                bbw_rank = r.get("bbw_pct_rank", np.nan)
-                rsi_val = float(r.get("rsi", np.nan))
-                adx_val = float(r.get("adx", np.nan))
-
-                bias = "LONG" if str(setup).startswith("Bullish") else "SHORT"
-                key = f"{symbol}|15M|Continuation|{signal_time}|{setup}|{bias}"
-
-                if key not in existing_keys_15m:
-    quality = compute_quality_score(r)
-    
-    # NEW: Create signal dictionary
-    signal_dict = {
-        "key": key,
-        "signal_time": signal_time,
-        "logged_at": logged_at,
-        "symbol": symbol,
-        "timeframe": "15M",
-        "mode": "Continuation",
-        "setup": setup,
-        "bias": bias,
-        "ltp": ltp,
-        "bbw": bbw,
-        "bbw_pct_rank": bbw_rank,
-        "rsi": rsi_val,
-        "adx": adx_val,
-        "trend": trend,
-        "quality_score": quality,
-        "params_hash": params_hash,
-    }
-    
-    # NEW: Add risk metrics
-    enhanced_signal = add_risk_metrics_to_signal(
-        signal_row=signal_dict,
-        df_ohlc=df,
-        account_capital=st.session_state.get("account_capital", 1000000.0),
-        risk_per_trade_pct=st.session_state.get("risk_per_trade", 1.0),
-        atr_multiplier=st.session_state.get("atr_multiplier", 2.0),
-        lookback_swing=20
-    )
-    
-    # Convert to row format for sheets
-    rows_15m.append([
-        enhanced_signal.get("key"),
-        enhanced_signal.get("signal_time"),
-        enhanced_signal.get("logged_at"),
-        enhanced_signal.get("symbol"),
-        enhanced_signal.get("timeframe"),
-        enhanced_signal.get("mode"),
-        enhanced_signal.get("setup"),
-        enhanced_signal.get("bias"),
-        enhanced_signal.get("ltp"),
-        enhanced_signal.get("bbw"),
-        enhanced_signal.get("bbw_pct_rank"),
-        enhanced_signal.get("rsi"),
-        enhanced_signal.get("adx"),
-        enhanced_signal.get("trend"),
-        enhanced_signal.get("quality_score"),
-        enhanced_signal.get("params_hash"),
-        enhanced_signal.get("atr"),
-        enhanced_signal.get("stop_loss"),
-        enhanced_signal.get("stop_method"),
-        enhanced_signal.get("shares"),
-        enhanced_signal.get("position_value"),
-        enhanced_signal.get("rupee_risk"),
-        enhanced_signal.get("risk_pct"),
-        enhanced_signal.get("risk_per_share"),
-        enhanced_signal.get("target_1.5R"),
-        enhanced_signal.get("target_2R"),
-        enhanced_signal.get("target_3R"),
-    ])
-
-
-        except Exception as e:
-            if st.session_state.get("show_debug", False):
-                st.warning(f"{symbol} 15M error: {e}")
-            continue
-
-    # Daily scan
-    for symbol in stock_list:
-        try:
-            df_daily = get_ohlc_daily(symbol, lookback_days=252)
-            df_daily = normalize_ohlc_index_to_ist(df_daily)
-            if df_daily is None or df_daily.shape[0] < 100:
-                continue
-
-            df_daily_prepped = prepare_trend_squeeze(df_daily, **build_kwargs(is_daily=True))
-
-            recent_daily = df_daily_prepped.tail(7).copy()
-            recent_daily = recent_daily[recent_daily[use_setup_col_local] != ""]
-
-            for candle_ts, r in recent_daily.iterrows():
-                signal_time = pd.Timestamp(candle_ts).strftime("%Y-%m-%d")
-                if pd.to_datetime(signal_time).date() > now_ist().date():
-                    continue
-
-                setup = r[use_setup_col_local]
-                trend = r.get("trend", "")
-                ltp = float(r.get("close", np.nan))
-                bbw = float(r.get("bbw", np.nan))
-                bbw_rank = r.get("bbw_pct_rank", np.nan)
-                rsi_val = float(r.get("rsi", np.nan))
-                adx_val = float(r.get("adx", np.nan))
-
-                bias = "LONG" if str(setup).startswith("Bullish") else "SHORT"
-                key = f"{symbol}|Daily|Continuation|{signal_time}|{setup}|{bias}"
-
-                if key not in existing_keys_daily:
-    quality = compute_quality_score(r)
-    
-    # NEW: Create signal dictionary
-    signal_dict = {
-        "key": key,
-        "signal_time": signal_time,
-        "logged_at": logged_at,
-        "symbol": symbol,
-        "timeframe": "daily",
-        "mode": "Continuation",
-        "setup": setup,
-        "bias": bias,
-        "ltp": ltp,
-        "bbw": bbw,
-        "bbw_pct_rank": bbw_rank,
-        "rsi": rsi_val,
-        "adx": adx_val,
-        "trend": trend,
-        "quality_score": quality,
-        "params_hash": params_hash,
-    }
-    
-    # NEW: Add risk metrics
-    enhanced_signal = add_risk_metrics_to_signal(
-        signal_row=signal_dict,
-        df_ohlc=df,
-        account_capital=st.session_state.get("account_capital", 1000000.0),
-        risk_per_trade_pct=st.session_state.get("risk_per_trade", 1.0),
-        atr_multiplier=st.session_state.get("atr_multiplier", 2.0),
-        lookback_swing=20
-    )
-    
-    # Convert to row format for sheets
-    rows_daily.append([
-        enhanced_signal.get("key"),
-        enhanced_signal.get("signal_time"),
-        enhanced_signal.get("logged_at"),
-        enhanced_signal.get("symbol"),
-        enhanced_signal.get("timeframe"),
-        enhanced_signal.get("mode"),
-        enhanced_signal.get("setup"),
-        enhanced_signal.get("bias"),
-        enhanced_signal.get("ltp"),
-        enhanced_signal.get("bbw"),
-        enhanced_signal.get("bbw_pct_rank"),
-        enhanced_signal.get("rsi"),
-        enhanced_signal.get("adx"),
-        enhanced_signal.get("trend"),
-        enhanced_signal.get("quality_score"),
-        enhanced_signal.get("params_hash"),
-        enhanced_signal.get("atr"),
-        enhanced_signal.get("stop_loss"),
-        enhanced_signal.get("stop_method"),
-        enhanced_signal.get("shares"),
-        enhanced_signal.get("position_value"),
-        enhanced_signal.get("rupee_risk"),
-        enhanced_signal.get("risk_pct"),
-        enhanced_signal.get("risk_per_share"),
-        enhanced_signal.get("target_1.5R"),
-        enhanced_signal.get("target_2R"),
-        enhanced_signal.get("target_3R"),
-    ])
-
-
-        except Exception as e:
-            if st.session_state.get("show_debug", False):
-                st.warning(f"{symbol} Daily error: {e}")
-            continue
-
-    appended_15m = 0
-    appended_daily = 0
-    if ws_15m and not ws_15m_err:
-        appended_15m, _ = append_signals(ws_15m, rows_15m, st.session_state.get("show_debug", False))
-    if ws_daily and not ws_daily_err:
-        appended_daily, _ = append_signals(ws_daily, rows_daily, st.session_state.get("show_debug", False))
-
-    st.caption(f"Logged **{appended_15m}** new 15M + **{appended_daily}** Daily signals.")
-
-st.caption("✅ No Streamlit ternary rendering anywhere = no more DeltaGenerator dumps.")
-
-
-
-
+    "M&M","MARUTI","NESTLEIND","NTPC","ONGC","POWERGRID","RELIANCE
