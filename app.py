@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-# Optional autorefresh (won't crash if missing)
+# Optional autorefresh
 try:
     from streamlit_autorefresh import st_autorefresh
 except Exception:
@@ -22,7 +22,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from gspread.exceptions import SpreadsheetNotFound, APIError
 
-# FYERS (v3)
+# FYERS v3
 FYERS_IMPORT_OK = True
 FYERS_IMPORT_ERR = ""
 try:
@@ -36,9 +36,8 @@ except Exception as e:
 # Streamlit config
 # =========================
 st.set_page_config(page_title="📉 Trend Squeeze Screener", layout="wide")
-
 if st_autorefresh is not None:
-    st_autorefresh(interval=300000, key="auto_refresh")  # 5 minutes
+    st_autorefresh(interval=300000, key="auto_refresh")  # 5 min
 
 
 # =========================
@@ -48,10 +47,6 @@ IST = ZoneInfo("Asia/Kolkata")
 MARKET_OPEN = dtime(9, 15)
 MARKET_CLOSE = dtime(15, 30)
 
-SIGNAL_SHEET_15M_NAME = "TrendSqueezeSignals_15M"
-SIGNAL_SHEET_DAILY_NAME = "TrendSqueezeSignals_Daily"
-
-# Default signal sheet IDs (you can override via st.secrets)
 DEFAULT_SHEET_ID_15M = "1RP2tbh6WnMgEDAv5FWXD6GhePXno9bZ81ILFyoX6Fb8"
 DEFAULT_SHEET_ID_DAILY = "1u-W5vu3KM6XPRr78o8yyK8pPaAjRUIFEEYKHyYGUsM0"
 
@@ -109,7 +104,7 @@ def now_ist() -> datetime:
     return datetime.now(IST)
 
 def is_trading_day(d) -> bool:
-    # Minimal fallback: Mon–Fri. (Holiday calendar not included.)
+    # Simple fallback: Mon–Fri. (No holiday calendar here.)
     return pd.Timestamp(d).dayofweek < 5
 
 def market_open_now() -> bool:
@@ -155,24 +150,15 @@ def get_gspread_client() -> Tuple[Optional[gspread.Client], Optional[str]]:
     except Exception as e:
         return None, f"Google auth failed: {e}"
 
-
-def open_or_create_sheet_by_key(client: gspread.Client, sheet_key: str):
-    return client.open_by_key(sheet_key)
-
 def ensure_header(ws, header: List[str]) -> None:
     existing = ws.row_values(1)
     if not existing:
         ws.update("A1", [header])
         return
-    # If shorter or missing columns, overwrite row1 with canonical header
     if len(existing) < len(header):
         ws.update("A1", [header])
 
-
 def get_signals_worksheet(sheet_kind: str) -> Tuple[Optional[gspread.Worksheet], Optional[str]]:
-    """
-    sheet_kind: "15M" or "DAILY"
-    """
     client, err = get_gspread_client()
     if err:
         return None, err
@@ -182,14 +168,14 @@ def get_signals_worksheet(sheet_kind: str) -> Tuple[Optional[gspread.Worksheet],
 
     try:
         if sheet_kind.upper() == "15M":
-            sh = open_or_create_sheet_by_key(client, sheet_id_15m)
+            sh = client.open_by_key(sheet_id_15m)
         else:
-            sh = open_or_create_sheet_by_key(client, sheet_id_daily)
+            sh = client.open_by_key(sheet_id_daily)
         ws = sh.sheet1
         ensure_header(ws, SIGNAL_COLUMNS)
         return ws, None
     except SpreadsheetNotFound:
-        return None, f"Signals sheet not found for {sheet_kind}. Check Sheet ID and sharing."
+        return None, f"Signals sheet not found for {sheet_kind}. Check sheet ID & sharing."
     except Exception as e:
         return None, f"Failed to open signals sheet ({sheet_kind}): {e}"
 
@@ -202,7 +188,7 @@ def get_fyers_token_worksheet() -> Tuple[Optional[gspread.Worksheet], Optional[s
     sheet_name = st.secrets.get("FYERS_TOKEN_SHEET_NAME", None)
 
     if not sheet_key and not sheet_name:
-        return None, "Missing FYERS_TOKEN_SHEET_KEY (or FYERS_TOKEN_SHEET_NAME) in Streamlit secrets."
+        return None, "Missing FYERS_TOKEN_SHEET_KEY (or FYERS_TOKEN_SHEET_NAME) in secrets."
 
     client, err = get_gspread_client()
     if err:
@@ -211,7 +197,7 @@ def get_fyers_token_worksheet() -> Tuple[Optional[gspread.Worksheet], Optional[s
     try:
         sh = client.open_by_key(sheet_key) if sheet_key else client.open(sheet_name)
         ws = sh.sheet1
-        # Ensure headers
+
         existing = ws.row_values(1)
         if not existing:
             ws.update("A1", [FYERS_TOKEN_HEADERS])
@@ -224,12 +210,12 @@ def get_fyers_token_worksheet() -> Tuple[Optional[gspread.Worksheet], Optional[s
                     changed = True
             if changed:
                 ws.update("A1", [header_l])
+
         return ws, None
     except SpreadsheetNotFound:
         return None, "FYERS token sheet not found (check key/name and sharing)."
     except Exception as e:
         return None, f"Failed to open FYERS token sheet: {e}"
-
 
 def read_fyers_row(ws: gspread.Worksheet) -> Tuple[str, str, str, str]:
     try:
@@ -255,12 +241,10 @@ def read_fyers_row(ws: gspread.Worksheet) -> Tuple[str, str, str, str]:
     except Exception:
         return "", "", "", ""
 
-
 def ensure_row2(ws: gspread.Worksheet) -> None:
     vals = ws.get_all_values()
     if len(vals) < 2:
         ws.append_row(["", "", "", ""], value_input_option="USER_ENTERED")
-
 
 def update_fyers_token(ws: gspread.Worksheet, token: str, timestamp: str) -> None:
     header = [h.strip() for h in ws.row_values(1)]
@@ -275,7 +259,6 @@ def update_fyers_token(ws: gspread.Worksheet, token: str, timestamp: str) -> Non
     ws.update_cell(2, col_token, token)
     ws.update_cell(2, col_ts, timestamp)
 
-
 def build_fyers_login_url(app_id: str, secret_id: str, redirect_uri: str) -> str:
     session = fyersModel.SessionModel(
         client_id=app_id,
@@ -285,7 +268,6 @@ def build_fyers_login_url(app_id: str, secret_id: str, redirect_uri: str) -> str
         grant_type="authorization_code",
     )
     return session.generate_authcode()
-
 
 def exchange_auth_code_for_token(app_id: str, secret_id: str, redirect_uri: str, auth_code: str) -> str:
     session = fyersModel.SessionModel(
@@ -301,10 +283,7 @@ def exchange_auth_code_for_token(app_id: str, secret_id: str, redirect_uri: str,
         raise RuntimeError(f"Token exchange failed: {resp}")
     return str(resp["access_token"]).strip()
 
-
 def init_fyers(app_id: str, token: str):
-    # FYERS v3: token should usually be "appId:access_token" OR plain depending on broker config.
-    # Most setups work with plain token passed as `token=...`.
     return fyersModel.FyersModel(client_id=app_id, is_async=False, token=token, log_path="")
 
 
@@ -361,21 +340,12 @@ def bollinger(close: pd.Series, length: int = 20, mult: float = 2.0) -> Tuple[pd
     lower = mid - mult * std
     return lower, mid, upper
 
-def keltner(df: pd.DataFrame, length: int = 20, mult: float = 1.5) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    # Typical KC: EMA(close) +/- mult*ATR
-    mid = ema(df["close"], length)
-    rng = atr(df, length)
-    upper = mid + mult * rng
-    lower = mid - mult * rng
-    return lower, mid, upper
-
 def bbw(close: pd.Series, length: int = 20, mult: float = 2.0) -> pd.Series:
     lower, mid, upper = bollinger(close, length, mult)
     width = (upper - lower) / mid.replace(0, np.nan)
     return width
 
 def pct_rank(series: pd.Series, lookback: int = 252) -> pd.Series:
-    # Percentile rank of current value vs rolling window
     def _rank(window: np.ndarray) -> float:
         if len(window) < 5 or np.isnan(window[-1]):
             return np.nan
@@ -397,7 +367,7 @@ def trend_label(close: pd.Series) -> pd.Series:
 
 
 # =========================
-# Strategy: prepare signals
+# Strategy
 # =========================
 @dataclass
 class StrategyParams:
@@ -414,6 +384,7 @@ class StrategyParams:
 
 def prepare_trend_squeeze_df(df: pd.DataFrame, params: StrategyParams) -> pd.DataFrame:
     out = df.copy()
+
     out["ema50"] = ema(out["close"], 50)
     out["ema200"] = ema(out["close"], 200)
     out["rsi"] = rsi(out["close"], 14)
@@ -422,53 +393,42 @@ def prepare_trend_squeeze_df(df: pd.DataFrame, params: StrategyParams) -> pd.Dat
     out["bbw"] = bbw(out["close"], 20, 2.0)
     out["bbw_pct_rank"] = pct_rank(out["bbw"], lookback=252)
 
-    # Consolidation box
     look = int(params.breakout_lookback)
-    box_high = out["high"].rolling(look).max()
-    box_low = out["low"].rolling(look).min()
-    out["box_high"] = box_high
-    out["box_low"] = box_low
+    out["box_high"] = out["high"].rolling(look).max()
+    out["box_low"] = out["low"].rolling(look).min()
 
-    # Breakout direction
     out["break_up"] = out["close"] > out["box_high"].shift(1)
     out["break_dn"] = out["close"] < out["box_low"].shift(1)
 
-    # Optional BBW expansion: current bbw > median of last look candles
     bbw_med = out["bbw"].rolling(look).median()
     out["bbw_expand"] = out["bbw"] > bbw_med.shift(1)
 
-    # Optional volume spike
     vol_avg = out["volume"].rolling(look).mean()
     out["vol_spike"] = out["volume"] > (params.volume_spike_mult * vol_avg.shift(1))
 
-    # Core squeeze filter
     squeeze_ok = (
         (out["bbw"] <= params.bbw_abs_max) &
         (out["bbw_pct_rank"] <= params.bbw_pct_max) &
         (out["adx"] >= params.adx_min)
     )
 
-    # Momentum bias via RSI thresholds
     bull_mom = out["rsi"] >= params.rsi_bull_min
     bear_mom = out["rsi"] <= params.rsi_bear_max
 
-    # Build setup strings
     out["setup_forming"] = ""
     out["setup"] = ""
 
-    # Setup forming (watchlist): squeeze + (bull or bear momentum) even without breakout
     out.loc[squeeze_ok & bull_mom, "setup_forming"] = "Bullish Squeeze (forming)"
     out.loc[squeeze_ok & bear_mom, "setup_forming"] = "Bearish Squeeze (forming)"
 
-    # Breakout confirmed: squeeze + breakout + optional confirmations
-    confirm_mask = pd.Series(True, index=out.index)
+    confirm = pd.Series(True, index=out.index)
     if params.require_bbw_expansion:
-        confirm_mask &= out["bbw_expand"]
+        confirm &= out["bbw_expand"]
     if params.require_volume_spike:
-        confirm_mask &= out["vol_spike"]
+        confirm &= out["vol_spike"]
 
-    long_break = squeeze_ok & bull_mom & out["break_up"] & confirm_mask
-    short_break = squeeze_ok & bear_mom & out["break_dn"] & confirm_mask
+    long_break = squeeze_ok & bull_mom & out["break_up"] & confirm
+    short_break = squeeze_ok & bear_mom & out["break_dn"] & confirm
 
     out.loc[long_break, "setup"] = "Bullish Breakout"
     out.loc[short_break, "setup"] = "Bearish Breakdown"
@@ -477,7 +437,7 @@ def prepare_trend_squeeze_df(df: pd.DataFrame, params: StrategyParams) -> pd.Dat
 
 
 # =========================
-# Risk metrics
+# Risk enrichment
 # =========================
 def add_risk_metrics(
     row: Dict[str, Any],
@@ -497,7 +457,8 @@ def add_risk_metrics(
     if not np.isfinite(a) or not np.isfinite(ltp) or ltp <= 0:
         return out
 
-    stop = ltp - atr_mult * a if out.get("bias") == "LONG" else ltp + atr_mult * a
+    is_long = (out.get("bias") == "LONG")
+    stop = ltp - atr_mult * a if is_long else ltp + atr_mult * a
     risk_per_share = abs(ltp - stop)
 
     rupee_risk = account_capital * (risk_per_trade_pct / 100.0)
@@ -514,9 +475,9 @@ def add_risk_metrics(
         "rupee_risk": float(rupee_risk),
         "risk_pct": float(risk_pct),
         "risk_per_share": float(risk_per_share),
-        "target_1.5R": float(ltp + (1.5 * risk_per_share) if out.get("bias") == "LONG" else ltp - (1.5 * risk_per_share)),
-        "target_2R": float(ltp + (2.0 * risk_per_share) if out.get("bias") == "LONG" else ltp - (2.0 * risk_per_share)),
-        "target_3R": float(ltp + (3.0 * risk_per_share) if out.get("bias") == "LONG" else ltp - (3.0 * risk_per_share)),
+        "target_1.5R": float(ltp + (1.5 * risk_per_share) if is_long else ltp - (1.5 * risk_per_share)),
+        "target_2R": float(ltp + (2.0 * risk_per_share) if is_long else ltp - (2.0 * risk_per_share)),
+        "target_3R": float(ltp + (3.0 * risk_per_share) if is_long else ltp - (3.0 * risk_per_share)),
     })
     return out
 
@@ -537,7 +498,7 @@ def fyers_history_df(
     range_to: str,
 ) -> pd.DataFrame:
     fy = init_fyers(app_id, token)
-    data = {
+    payload = {
         "symbol": fy_symbol,
         "resolution": resolution,
         "date_format": "1",
@@ -545,7 +506,7 @@ def fyers_history_df(
         "range_to": range_to,
         "cont_flag": "1",
     }
-    resp = fy.history(data=data)
+    resp = fy.history(data=payload)
     if not isinstance(resp, dict) or resp.get("s") not in ("ok", "no_data"):
         raise RuntimeError(f"FYERS history error: {resp}")
 
@@ -554,38 +515,27 @@ def fyers_history_df(
         return pd.DataFrame()
 
     df = pd.DataFrame(candles, columns=["ts", "open", "high", "low", "close", "volume"])
+    # FYERS gives epoch seconds
     df["ts"] = pd.to_datetime(df["ts"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
     df = df.set_index("ts")
     return df
 
-
-def get_ohlc_15m(token: str, app_id: str, symbol: str, days_back: int = 15) -> pd.DataFrame:
+def get_ohlc(token: str, app_id: str, symbol: str, timeframe: str, days_back: int) -> pd.DataFrame:
     to_dt = now_ist().date()
     from_dt = (now_ist() - timedelta(days=days_back)).date()
+    res = "15" if timeframe == "15M" else "D"
     return fyers_history_df(
         token=token,
         app_id=app_id,
         fy_symbol=symbol_to_fyers(symbol),
-        resolution="15",
-        range_from=str(from_dt),
-        range_to=str(to_dt),
-    )
-
-def get_ohlc_daily(token: str, app_id: str, symbol: str, lookback_days: int = 400) -> pd.DataFrame:
-    to_dt = now_ist().date()
-    from_dt = (now_ist() - timedelta(days=lookback_days)).date()
-    return fyers_history_df(
-        token=token,
-        app_id=app_id,
-        fy_symbol=symbol_to_fyers(symbol),
-        resolution="D",
+        resolution=res,
         range_from=str(from_dt),
         range_to=str(to_dt),
     )
 
 
 # =========================
-# Sheet read/write helpers
+# Sheets helpers
 # =========================
 def fetch_existing_keys_recent(ws: gspread.Worksheet, days_back: int = 3) -> set:
     try:
@@ -640,7 +590,6 @@ def load_recent_signals(ws: gspread.Worksheet, hours: int, dedup: bool) -> pd.Da
         return df
 
     df["Timestamp"] = df["signal_time_dt"].dt.strftime("%d-%b-%Y %H:%M")
-
     df.rename(columns={
         "symbol": "Symbol",
         "timeframe": "Timeframe",
@@ -660,7 +609,6 @@ def load_recent_signals(ws: gspread.Worksheet, hours: int, dedup: bool) -> pd.Da
     }, inplace=True)
 
     df = df.sort_values("signal_time_dt", ascending=False)
-
     if dedup and {"Symbol", "Timeframe"}.issubset(df.columns):
         df = df.drop_duplicates(subset=["Symbol", "Timeframe"], keep="first")
 
@@ -669,7 +617,6 @@ def load_recent_signals(ws: gspread.Worksheet, hours: int, dedup: bool) -> pd.Da
         if c not in df.columns:
             df[c] = None
     return df[cols]
-
 
 def compute_quality_score(r: pd.Series) -> str:
     score = 0
@@ -701,21 +648,188 @@ def compute_quality_score(r: pd.Series) -> str:
         return "B"
     return "C"
 
-
-def params_to_hash(p: StrategyParams) -> str:
+def params_hash(p: StrategyParams) -> str:
     return f"{p.bbw_abs_max:.3f}|{p.bbw_pct_max:.2f}|{p.adx_min:.1f}|{p.rsi_bull_min:.1f}|{p.rsi_bear_max:.1f}|L{p.breakout_lookback}"
 
 
 # =========================
-# UI: Sidebar
+# Backtest engine
+# =========================
+@dataclass
+class BacktestResult:
+    equity: pd.Series
+    trades: pd.DataFrame
+    metrics: Dict[str, float]
+
+def max_drawdown(equity: pd.Series) -> float:
+    if equity.empty:
+        return 0.0
+    peak = equity.cummax()
+    dd = (equity / peak) - 1.0
+    return float(dd.min())
+
+def sharpe_like(equity: pd.Series, periods_per_year: int) -> float:
+    if len(equity) < 3:
+        return 0.0
+    rets = equity.pct_change().dropna()
+    if rets.std() == 0:
+        return 0.0
+    return float((rets.mean() / rets.std()) * np.sqrt(periods_per_year))
+
+def backtest_squeeze(
+    df: pd.DataFrame,
+    params: StrategyParams,
+    use_confirmed: bool,
+    capital: float,
+    risk_pct: float,
+    atr_mult: float,
+    rr_takeprofit: float,
+    brokerage_bps: float,
+    slippage_bps: float,
+    periods_per_year: int,
+) -> BacktestResult:
+    prep = prepare_trend_squeeze_df(df, params)
+    col = "setup" if use_confirmed else "setup_forming"
+
+    equity = []
+    eq = float(capital)
+
+    position = 0  # +qty for long, -qty for short
+    entry = np.nan
+    stop = np.nan
+    target = np.nan
+    entry_time = None
+
+    trades = []
+
+    # precompute ATR
+    prep["atr14"] = atr(prep, 14)
+
+    for i in range(1, len(prep)):
+        ts = prep.index[i]
+        row = prep.iloc[i]
+        prev = prep.iloc[i - 1]
+
+        price = float(row["close"])
+        if not np.isfinite(price) or price <= 0:
+            equity.append(eq)
+            continue
+
+        # mark-to-market (simple)
+        if position != 0 and np.isfinite(entry):
+            # MTM based on close-to-close
+            prev_price = float(prev["close"])
+            if np.isfinite(prev_price) and prev_price > 0:
+                eq += position * (price - prev_price)
+
+        # Manage open position exits
+        if position != 0:
+            high = float(row["high"])
+            low = float(row["low"])
+
+            exit_price = None
+            exit_reason = None
+
+            if position > 0:
+                if np.isfinite(stop) and low <= stop:
+                    exit_price = stop
+                    exit_reason = "SL"
+                elif np.isfinite(target) and high >= target:
+                    exit_price = target
+                    exit_reason = "TP"
+            else:
+                if np.isfinite(stop) and high >= stop:
+                    exit_price = stop
+                    exit_reason = "SL"
+                elif np.isfinite(target) and low <= target:
+                    exit_price = target
+                    exit_reason = "TP"
+
+            if exit_price is not None and entry_time is not None:
+                # Costs
+                slip = exit_price * (slippage_bps / 10000.0)
+                cost = abs(position) * exit_price * (brokerage_bps / 10000.0)
+                exec_px = exit_price - slip if position > 0 else exit_price + slip
+
+                pnl = position * (exec_px - entry) - cost
+                eq += pnl
+
+                trades.append({
+                    "Entry Time": entry_time,
+                    "Exit Time": ts,
+                    "Side": "LONG" if position > 0 else "SHORT",
+                    "Qty": abs(position),
+                    "Entry": entry,
+                    "Exit": exec_px,
+                    "PnL": pnl,
+                    "Reason": exit_reason,
+                })
+
+                position = 0
+                entry = np.nan
+                stop = np.nan
+                target = np.nan
+                entry_time = None
+
+        # Entry logic (after exit management)
+        setup_val = str(row.get(col, "") or "")
+        if position == 0 and setup_val != "":
+            a = float(row.get("atr14", np.nan))
+            if np.isfinite(a) and a > 0:
+                bias_long = setup_val.startswith("Bull")
+                risk_rupees = capital * (risk_pct / 100.0)
+                sl_dist = atr_mult * a
+                qty = int(max(1, np.floor(risk_rupees / max(sl_dist, 1e-6))))
+
+                # Execution (slippage) at close (simple)
+                slip = price * (slippage_bps / 10000.0)
+                exec_px = price + slip if bias_long else price - slip
+                cost = qty * exec_px * (brokerage_bps / 10000.0)
+
+                if bias_long:
+                    position = qty
+                    entry = exec_px
+                    stop = entry - sl_dist
+                    target = entry + rr_takeprofit * sl_dist
+                else:
+                    position = -qty
+                    entry = exec_px
+                    stop = entry + sl_dist
+                    target = entry - rr_takeprofit * sl_dist
+
+                eq -= cost
+                entry_time = ts
+
+        equity.append(eq)
+
+    equity_s = pd.Series(equity, index=prep.index[1:1+len(equity)])
+
+    tdf = pd.DataFrame(trades)
+    wins = float((tdf["PnL"] > 0).mean() * 100.0) if not tdf.empty else 0.0
+    total_ret = float((equity_s.iloc[-1] / capital - 1.0) * 100.0) if not equity_s.empty else 0.0
+    mdd = float(max_drawdown(equity_s) * 100.0) if not equity_s.empty else 0.0
+    sh = float(sharpe_like(equity_s, periods_per_year)) if not equity_s.empty else 0.0
+
+    metrics = {
+        "Total Return %": total_ret,
+        "Trades": float(len(tdf)),
+        "Win %": wins,
+        "Max DD %": mdd,
+        "Sharpe": sh,
+    }
+    return BacktestResult(equity=equity_s, trades=tdf, metrics=metrics)
+
+
+# =========================
+# Sidebar (NO DeltaGenerator expression tricks)
 # =========================
 with st.sidebar:
     st.header("🔐 FYERS Login")
 
     if not FYERS_IMPORT_OK:
-        st.error("FYERS client library missing ❌")
+        st.error("FYERS library missing ❌")
         st.caption(f"Import error: {FYERS_IMPORT_ERR}")
-        st.caption("Fix: add `fyers-apiv3==3.1.7` to requirements.txt and redeploy.")
+        st.caption("Fix: add `fyers-apiv3` to requirements.txt and redeploy.")
         st.stop()
 
     ws_token, ws_token_err = get_fyers_token_worksheet()
@@ -728,20 +842,19 @@ with st.sidebar:
 
     if updated_at:
         st.caption(f"Last updated: {updated_at}")
+
     if access_token:
         st.success("Token found ✅")
     else:
         st.warning("No access token yet ❗")
 
-    redirect_uri = st.secrets.get(
-        "FYERS_REDIRECT_URI",
-        "https://trade.fyers.in/api-login/redirect-uri/index.html"
-    )
+    redirect_uri = st.secrets.get("FYERS_REDIRECT_URI", "https://trade.fyers.in/api-login/redirect-uri/index.html")
 
     if not app_id or not secret_id:
         st.error("Fill fyers_app_id and fyers_secret_id in token sheet (row 2).")
         st.stop()
 
+    # Login URL
     try:
         login_url = build_fyers_login_url(app_id, secret_id, redirect_uri)
         if hasattr(st, "link_button"):
@@ -753,7 +866,8 @@ with st.sidebar:
         st.error(f"Login URL failed: {e}")
 
     auth_code = st.text_input("2) Paste auth_code", value="", key="auth_code_input")
-    if st.button("3) Exchange & Save Token", type="primary"):
+
+    if st.button("3) Exchange & Save Token", type="primary", key="exchange_btn"):
         if not auth_code.strip():
             st.error("Paste auth_code first.")
         else:
@@ -769,7 +883,6 @@ with st.sidebar:
 
     st.divider()
     st.subheader("⚙️ Settings")
-
     st.checkbox("Show debug", value=False, key="debug")
     st.checkbox("Audit mode (no de-dup)", value=False, key="audit_mode")
     st.slider("Retention (hours)", 6, 72, 24, 6, key="retention_hours")
@@ -800,23 +913,25 @@ with st.sidebar:
 
 
 # =========================
-# Main
+# Main header
 # =========================
 st.title("📉 Trend Squeeze Screener")
-
 n = now_ist()
-st.caption(f"{'🟢 LIVE MARKET' if market_open_now() else '🔵 OFF-MARKET'} • Last refresh: {n.strftime('%d %b %Y • %H:%M:%S')} IST")
+if market_open_now():
+    st.caption(f"🟢 LIVE MARKET • Last refresh: {n.strftime('%d %b %Y • %H:%M:%S')} IST")
+else:
+    st.caption(f"🔵 OFF-MARKET • Last refresh: {n.strftime('%d %b %Y • %H:%M:%S')} IST")
+
 st.caption(f"Universe: NIFTY50 ({len(NIFTY50)} symbols)")
 
 if not access_token:
     st.error("🔴 FYERS not initialized (no valid token). Use the sidebar login flow.")
     st.stop()
 
-# Init FYERS + smoke test on a single symbol
+# FYERS smoke test
 try:
     _ = init_fyers(app_id, access_token)
-    # quick test call
-    test_df = get_ohlc_15m(access_token, app_id, "RELIANCE", days_back=7)
+    test_df = get_ohlc(access_token, app_id, "RELIANCE", "15M", 7)
     if test_df is None or test_df.empty:
         st.warning("⚠️ FYERS session OK but history returned empty for RELIANCE.")
     else:
@@ -835,58 +950,262 @@ ws_daily, err_daily = get_signals_worksheet("DAILY")
 cA, cB = st.columns(2)
 with cA:
     st.write("**15M Sheet**")
-    st.success("Connected ✅" if not err_15m else "Not connected ❌")
     if err_15m:
+        st.error("Not connected ❌")
         st.caption(err_15m)
+    else:
+        st.success("Connected ✅")
 with cB:
     st.write("**Daily Sheet**")
-    st.success("Connected ✅" if not err_daily else "Not connected ❌")
     if err_daily:
+        st.error("Not connected ❌")
         st.caption(err_daily)
+    else:
+        st.success("Connected ✅")
 
 if err_15m or err_daily:
     st.stop()
 
 
 # =========================
-# Recent signals display
+# Tabs
 # =========================
-def filter_quality(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty or "Quality" not in df.columns:
+tab_live, tab_bt = st.tabs(["📈 Live Screener", "⚙️ Backtest"])
+
+
+# =========================
+# Live Screener
+# =========================
+with tab_live:
+    st.subheader("🧠 Recent Signals")
+
+    dedup = True
+    if st.session_state.get("audit_mode", False):
+        dedup = False
+
+    df_recent_15m = load_recent_signals(ws_15m, st.session_state["retention_hours"], dedup=dedup)
+    df_recent_daily = load_recent_signals(ws_daily, st.session_state["retention_hours"], dedup=dedup)
+
+    def filter_quality(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or df.empty or "Quality" not in df.columns:
+            return df
+        pref = st.session_state.get("quality_pref", "A only")
+        if pref == "A only":
+            return df[df["Quality"] == "A"].copy()
+        if pref == "A + B":
+            return df[df["Quality"].isin(["A", "B"])].copy()
         return df
-    pref = st.session_state.get("quality_pref", "A only")
-    if pref == "A only":
-        return df[df["Quality"] == "A"].copy()
-    if pref == "A + B":
-        return df[df["Quality"].isin(["A", "B"])].copy()
-    return df
 
-st.subheader("🧠 Recent Signals")
-dedup = not st.session_state.get("audit_mode", False)
+    df_recent_15m = filter_quality(df_recent_15m)
+    df_recent_daily = filter_quality(df_recent_daily)
 
-df_recent_15m = load_recent_signals(ws_15m, st.session_state["retention_hours"], dedup=dedup)
-df_recent_daily = load_recent_signals(ws_daily, st.session_state["retention_hours"], dedup=dedup)
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("### 15M")
+        if df_recent_15m is not None and not df_recent_15m.empty:
+            st.dataframe(df_recent_15m, use_container_width=True)
+        else:
+            st.info("No signals in window.")
+    with c2:
+        st.markdown("### Daily")
+        if df_recent_daily is not None and not df_recent_daily.empty:
+            st.dataframe(df_recent_daily, use_container_width=True)
+        else:
+            st.info("No signals in window.")
 
-df_recent_15m = filter_quality(df_recent_15m)
-df_recent_daily = filter_quality(df_recent_daily)
+    st.divider()
 
-c1, c2 = st.columns(2)
-with c1:
-    st.markdown("### 15M")
-    st.dataframe(df_recent_15m, use_container_width=True) if not df_recent_15m.empty else st.info("No signals in window.")
-with c2:
-    st.markdown("### Daily")
-    st.dataframe(df_recent_daily, use_container_width=True) if not df_recent_daily.empty else st.info("No signals in window.")
+    # Scan & Log
+    with st.expander("🔎 Scan & Log (runs every refresh)", expanded=False):
+        debug = st.session_state.get("debug", False)
 
-st.divider()
+        params = StrategyParams(
+            bbw_abs_max=float(st.session_state["bbw_abs_max"]),
+            bbw_pct_max=float(st.session_state["bbw_pct_max"]),
+            adx_min=float(st.session_state["adx_min"]),
+            rsi_bull_min=float(st.session_state["rsi_bull_min"]),
+            rsi_bear_max=float(st.session_state["rsi_bear_max"]),
+            breakout_lookback=int(st.session_state["breakout_lookback"]),
+            require_bbw_expansion=bool(st.session_state["require_bbw_expansion"]),
+            require_volume_spike=bool(st.session_state["require_volume_spike"]),
+            volume_spike_mult=float(st.session_state["volume_spike_mult"]),
+        )
+
+        ph = params_hash(params)
+        logged_at = fmt_dt(now_ist())
+
+        use_confirmed = st.session_state.get("signal_mode", "").startswith("✅")
+        setup_col = "setup" if use_confirmed else "setup_forming"
+
+        existing_15m = fetch_existing_keys_recent(ws_15m, days_back=3)
+        existing_daily = fetch_existing_keys_recent(ws_daily, days_back=14)
+
+        rows_15m: List[List[Any]] = []
+        rows_daily: List[List[Any]] = []
+
+        prog = st.progress(0.0)
+        total = len(NIFTY50)
+
+        today = now_ist().date()
+        last_daily_scan = st.session_state.get("last_daily_scan_date", None)
+        run_daily = (last_daily_scan != str(today))
+
+        for i, sym in enumerate(NIFTY50, start=1):
+            prog.progress(i / total)
+
+            # 15M
+            try:
+                df15 = get_ohlc(access_token, app_id, sym, "15M", 15)
+                if df15 is not None and len(df15) >= 200:
+                    prep = prepare_trend_squeeze_df(df15, params)
+                    recent = prep.tail(int(st.session_state["catchup_15m"])).copy()
+                    recent = recent[recent[setup_col] != ""]
+                    for candle_ts, r in recent.iterrows():
+                        sig_time = ts_to_sheet_str(pd.Timestamp(candle_ts), "15min")
+                        setup = str(r[setup_col])
+                        bias = "LONG" if setup.startswith("Bull") else "SHORT"
+                        key = f"{sym}|15M|Continuation|{sig_time}|{setup}|{bias}"
+                        if key in existing_15m:
+                            continue
+
+                        base = {
+                            "key": key,
+                            "signal_time": sig_time,
+                            "logged_at": logged_at,
+                            "symbol": sym,
+                            "timeframe": "15M",
+                            "mode": "Continuation",
+                            "setup": setup,
+                            "bias": bias,
+                            "ltp": safe_float(r.get("close")),
+                            "bbw": safe_float(r.get("bbw")),
+                            "bbw_pct_rank": safe_float(r.get("bbw_pct_rank")),
+                            "rsi": safe_float(r.get("rsi")),
+                            "adx": safe_float(r.get("adx")),
+                            "trend": str(r.get("trend", "")),
+                            "quality_score": compute_quality_score(r),
+                            "params_hash": ph,
+                        }
+
+                        enriched = add_risk_metrics(
+                            base,
+                            df15,
+                            account_capital=float(st.session_state["capital"]),
+                            risk_per_trade_pct=float(st.session_state["risk_pct"]),
+                            atr_mult=float(st.session_state["atr_mult"]),
+                        )
+
+                        rows_15m.append([enriched.get(c) for c in SIGNAL_COLUMNS])
+                        existing_15m.add(key)
+            except Exception as e:
+                if debug:
+                    st.warning(f"{sym} 15M error: {e}")
+
+            # Daily once/day
+            if run_daily:
+                try:
+                    dfd = get_ohlc(access_token, app_id, sym, "Daily", 450)
+                    if dfd is not None and len(dfd) >= 150:
+                        prep_d = prepare_trend_squeeze_df(dfd, params)
+                        recent_d = prep_d.tail(10).copy()
+                        recent_d = recent_d[recent_d[setup_col] != ""]
+                        for candle_ts, r in recent_d.iterrows():
+                            sig_time = pd.Timestamp(candle_ts).strftime("%Y-%m-%d")
+                            setup = str(r[setup_col])
+                            bias = "LONG" if setup.startswith("Bull") else "SHORT"
+                            key = f"{sym}|Daily|Continuation|{sig_time}|{setup}|{bias}"
+                            if key in existing_daily:
+                                continue
+
+                            base = {
+                                "key": key,
+                                "signal_time": sig_time,
+                                "logged_at": logged_at,
+                                "symbol": sym,
+                                "timeframe": "Daily",
+                                "mode": "Continuation",
+                                "setup": setup,
+                                "bias": bias,
+                                "ltp": safe_float(r.get("close")),
+                                "bbw": safe_float(r.get("bbw")),
+                                "bbw_pct_rank": safe_float(r.get("bbw_pct_rank")),
+                                "rsi": safe_float(r.get("rsi")),
+                                "adx": safe_float(r.get("adx")),
+                                "trend": str(r.get("trend", "")),
+                                "quality_score": compute_quality_score(r),
+                                "params_hash": ph,
+                            }
+
+                            enriched = add_risk_metrics(
+                                base,
+                                dfd,
+                                account_capital=float(st.session_state["capital"]),
+                                risk_per_trade_pct=float(st.session_state["risk_pct"]),
+                                atr_mult=float(st.session_state["atr_mult"]),
+                            )
+
+                            rows_daily.append([enriched.get(c) for c in SIGNAL_COLUMNS])
+                            existing_daily.add(key)
+                except Exception as e:
+                    if debug:
+                        st.warning(f"{sym} Daily error: {e}")
+
+        prog.empty()
+
+        a15, e15 = append_signals(ws_15m, rows_15m, debug=debug)
+        if run_daily:
+            ad, ed = append_signals(ws_daily, rows_daily, debug=debug)
+        else:
+            ad, ed = 0, None
+
+        if run_daily:
+            st.session_state["last_daily_scan_date"] = str(today)
+
+        if e15:
+            st.error(e15)
+        if ed:
+            st.error(ed)
+
+        if run_daily:
+            st.caption(f"Logged **{a15}** new 15M + **{ad}** Daily signals.")
+        else:
+            st.caption(f"Logged **{a15}** new 15M signals. (Daily scan already done today.)")
 
 
 # =========================
-# Scan + log
+# Backtest
 # =========================
-with st.expander("🔎 Scan & Log (runs every refresh)", expanded=False):
-    debug = st.session_state.get("debug", False)
+with tab_bt:
+    st.subheader("⚙️ Backtest (FYERS data)")
 
+    colA, colB, colC = st.columns([2, 2, 2])
+    with colA:
+        bt_symbol = st.selectbox("Symbol", options=sorted(NIFTY50), index=sorted(NIFTY50).index("RELIANCE") if "RELIANCE" in NIFTY50 else 0)
+    with colB:
+        bt_tf = st.selectbox("Timeframe", options=["Daily", "15M"], index=0)
+    with colC:
+        bt_days = st.slider("Lookback days", 60, 900, 450 if bt_tf == "Daily" else 180, 30)
+
+    st.divider()
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        bt_capital = st.number_input("Capital (₹)", min_value=50_000.0, max_value=100_000_000.0, value=float(st.session_state["capital"]), step=50_000.0)
+    with col2:
+        bt_risk = st.slider("Risk per trade (%)", 0.25, 3.0, float(st.session_state["risk_pct"]), 0.05)
+    with col3:
+        bt_atr_mult = st.slider("ATR stop multiplier", 1.0, 4.0, float(st.session_state["atr_mult"]), 0.25)
+    with col4:
+        bt_rr = st.slider("Take-profit (R multiple)", 1.0, 5.0, 2.0, 0.25)
+
+    st.caption("Costs are simplified (bps). This is a *sanity backtest*, not a broker contract note simulator. 😄")
+    col5, col6 = st.columns(2)
+    with col5:
+        bt_broker_bps = st.slider("Brokerage/fees (bps)", 0.0, 50.0, 6.0, 1.0)
+    with col6:
+        bt_slip_bps = st.slider("Slippage (bps)", 0.0, 50.0, 10.0, 1.0)
+
+    # Strategy params (same as sidebar)
     params = StrategyParams(
         bbw_abs_max=float(st.session_state["bbw_abs_max"]),
         bbw_pct_max=float(st.session_state["bbw_pct_max"]),
@@ -898,139 +1217,55 @@ with st.expander("🔎 Scan & Log (runs every refresh)", expanded=False):
         require_volume_spike=bool(st.session_state["require_volume_spike"]),
         volume_spike_mult=float(st.session_state["volume_spike_mult"]),
     )
-    params_hash = params_to_hash(params)
-    logged_at = fmt_dt(now_ist())
 
-    use_confirmed = st.session_state.get("signal_mode", "").startswith("✅")
-    setup_col = "setup" if use_confirmed else "setup_forming"
+    use_confirmed = True  # Backtest defaults to confirmed signals
+    periods_per_year = 252 if bt_tf == "Daily" else 252 * 6  # rough: ~6x 15m bars per day
 
-    existing_15m = fetch_existing_keys_recent(ws_15m, days_back=3)
-    existing_daily = fetch_existing_keys_recent(ws_daily, days_back=14)
-
-    rows_15m: List[List[Any]] = []
-    rows_daily: List[List[Any]] = []
-
-    prog = st.progress(0)
-    total = len(NIFTY50)
-
-    # Daily scan only once per date unless user is in audit/debug mood
-    today = now_ist().date()
-    last_daily_scan = st.session_state.get("last_daily_scan_date", None)
-    run_daily = (last_daily_scan != str(today))
-
-    for i, sym in enumerate(NIFTY50, start=1):
-        prog.progress(i / total)
-
-        # --- 15M ---
-        try:
-            df15 = get_ohlc_15m(access_token, app_id, sym, days_back=15)
-            if df15 is not None and len(df15) >= 200:
-                prep = prepare_trend_squeeze_df(df15, params)
-                recent = prep.tail(int(st.session_state["catchup_15m"])).copy()
-                recent = recent[recent[setup_col] != ""]
-                for candle_ts, r in recent.iterrows():
-                    sig_time = ts_to_sheet_str(pd.Timestamp(candle_ts), "15min")
-                    setup = str(r[setup_col])
-                    bias = "LONG" if setup.startswith("Bull") else "SHORT"
-                    key = f"{sym}|15M|Continuation|{sig_time}|{setup}|{bias}"
-                    if key in existing_15m:
-                        continue
-
-                    base = {
-                        "key": key,
-                        "signal_time": sig_time,
-                        "logged_at": logged_at,
-                        "symbol": sym,
-                        "timeframe": "15M",
-                        "mode": "Continuation",
-                        "setup": setup,
-                        "bias": bias,
-                        "ltp": safe_float(r.get("close")),
-                        "bbw": safe_float(r.get("bbw")),
-                        "bbw_pct_rank": safe_float(r.get("bbw_pct_rank")),
-                        "rsi": safe_float(r.get("rsi")),
-                        "adx": safe_float(r.get("adx")),
-                        "trend": str(r.get("trend", "")),
-                        "quality_score": compute_quality_score(r),
-                        "params_hash": params_hash,
-                    }
-
-                    enriched = add_risk_metrics(
-                        base,
-                        df15,
-                        account_capital=float(st.session_state["capital"]),
-                        risk_per_trade_pct=float(st.session_state["risk_pct"]),
-                        atr_mult=float(st.session_state["atr_mult"]),
+    if st.button("Run Backtest", type="primary"):
+        with st.spinner("Fetching FYERS candles + simulating trades..."):
+            try:
+                df_bt = get_ohlc(access_token, app_id, bt_symbol, bt_tf, bt_days)
+                if df_bt is None or df_bt.empty or len(df_bt) < 120:
+                    st.error("Not enough data returned from FYERS for this window.")
+                else:
+                    res = backtest_squeeze(
+                        df=df_bt,
+                        params=params,
+                        use_confirmed=use_confirmed,
+                        capital=float(bt_capital),
+                        risk_pct=float(bt_risk),
+                        atr_mult=float(bt_atr_mult),
+                        rr_takeprofit=float(bt_rr),
+                        brokerage_bps=float(bt_broker_bps),
+                        slippage_bps=float(bt_slip_bps),
+                        periods_per_year=int(periods_per_year),
                     )
 
-                    rows_15m.append([enriched.get(c) for c in SIGNAL_COLUMNS])
-                    existing_15m.add(key)
-        except Exception as e:
-            if debug:
-                st.warning(f"{sym} 15M error: {e}")
+                    m = res.metrics
+                    c1, c2, c3, c4, c5 = st.columns(5)
+                    c1.metric("Total Return", f"{m['Total Return %']:.1f}%")
+                    c2.metric("Trades", f"{int(m['Trades'])}")
+                    c3.metric("Win %", f"{m['Win %']:.1f}%")
+                    c4.metric("Max DD", f"{m['Max DD %']:.1f}%")
+                    c5.metric("Sharpe", f"{m['Sharpe']:.2f}")
 
-        # --- Daily (once per day) ---
-        if run_daily:
-            try:
-                dfd = get_ohlc_daily(access_token, app_id, sym, lookback_days=450)
-                if dfd is not None and len(dfd) >= 150:
-                    prep_d = prepare_trend_squeeze_df(dfd, params)
-                    recent_d = prep_d.tail(10).copy()
-                    recent_d = recent_d[recent_d[setup_col] != ""]
-                    for candle_ts, r in recent_d.iterrows():
-                        sig_time = pd.Timestamp(candle_ts).strftime("%Y-%m-%d")
-                        setup = str(r[setup_col])
-                        bias = "LONG" if setup.startswith("Bull") else "SHORT"
-                        key = f"{sym}|Daily|Continuation|{sig_time}|{setup}|{bias}"
-                        if key in existing_daily:
-                            continue
+                    st.markdown("### Equity Curve")
+                    st.line_chart(res.equity)
 
-                        base = {
-                            "key": key,
-                            "signal_time": sig_time,
-                            "logged_at": logged_at,
-                            "symbol": sym,
-                            "timeframe": "Daily",
-                            "mode": "Continuation",
-                            "setup": setup,
-                            "bias": bias,
-                            "ltp": safe_float(r.get("close")),
-                            "bbw": safe_float(r.get("bbw")),
-                            "bbw_pct_rank": safe_float(r.get("bbw_pct_rank")),
-                            "rsi": safe_float(r.get("rsi")),
-                            "adx": safe_float(r.get("adx")),
-                            "trend": str(r.get("trend", "")),
-                            "quality_score": compute_quality_score(r),
-                            "params_hash": params_hash,
-                        }
+                    st.markdown("### Trades")
+                    if res.trades.empty:
+                        st.info("No trades triggered for this config.")
+                    else:
+                        st.dataframe(res.trades.sort_values("Exit Time", ascending=False), use_container_width=True)
 
-                        enriched = add_risk_metrics(
-                            base,
-                            dfd,
-                            account_capital=float(st.session_state["capital"]),
-                            risk_per_trade_pct=float(st.session_state["risk_pct"]),
-                            atr_mult=float(st.session_state["atr_mult"]),
-                        )
-
-                        rows_daily.append([enriched.get(c) for c in SIGNAL_COLUMNS])
-                        existing_daily.add(key)
+                    # Download
+                    st.download_button(
+                        "💾 Download trades CSV",
+                        data=res.trades.to_csv(index=False),
+                        file_name=f"{bt_symbol}_{bt_tf}_trades.csv",
+                        mime="text/csv",
+                    )
             except Exception as e:
-                if debug:
-                    st.warning(f"{sym} Daily error: {e}")
+                st.error(f"Backtest failed: {e}")
 
-    prog.empty()
-
-    a15, e15 = append_signals(ws_15m, rows_15m, debug=debug)
-    ad, ed = append_signals(ws_daily, rows_daily, debug=debug) if run_daily else (0, None)
-
-    if run_daily:
-        st.session_state["last_daily_scan_date"] = str(today)
-
-    if e15:
-        st.error(e15)
-    if ed:
-        st.error(ed)
-
-    st.caption(f"Logged **{a15}** new 15M signals" + (f" + **{ad}** Daily signals." if run_daily else ". (Daily scan skipped — already done today.)"))
-
-st.caption("If this feels slower than your broker’s app at 9:15, that’s because we’re doing 50×2 history calls. 😄 Reduce refresh frequency or scan fewer symbols if you hit FYERS rate limits.")
+st.caption("No DeltaGenerator graffiti. If you see it again, it’s coming from another file/module being executed twice.")
