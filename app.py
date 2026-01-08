@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
+from utils.risk_calculator import add_risk_metrics_to_signal
 
 import gspread
 from gspread.exceptions import SpreadsheetNotFound, APIError
@@ -65,7 +66,20 @@ SIGNAL_COLUMNS = [
     "trend",
     "quality_score",
     "params_hash",
+    # NEW: Risk management columns
+    "atr",
+    "stop_loss",
+    "stop_method",
+    "shares",
+    "position_value",
+    "rupee_risk",
+    "risk_pct",
+    "risk_per_share",
+    "target_1.5R",
+    "target_2R",
+    "target_3R",
 ]
+
 
 FYERS_TOKEN_HEADERS = [
     "fyers_app_id",
@@ -490,22 +504,35 @@ def load_recent_signals(ws, base_hours: int = 24, timeframe: str = "15M", audit_
     df["Timestamp"] = df["signal_time_dt"].dt.strftime("%d-%b-%Y %H:%M")
 
     df.rename(
-        columns={
-            "symbol": "Symbol",
-            "timeframe": "Timeframe",
-            "mode": "Mode",
-            "setup": "Setup",
-            "bias": "Bias",
-            "ltp": "LTP",
-            "bbw": "BBW",
-            "bbw_pct_rank": "BBW %Rank",
-            "rsi": "RSI",
-            "adx": "ADX",
-            "trend": "Trend",
-            "quality_score": "Quality",
-        },
-        inplace=True,
-    )
+    columns={
+        "symbol": "Symbol",
+        "timeframe": "Timeframe",
+        "mode": "Mode",
+        "setup": "Setup",
+        "bias": "Bias",
+        "ltp": "LTP",
+        "bbw": "BBW",
+        "bbw_pct_rank": "BBW %Rank",
+        "rsi": "RSI",
+        "adx": "ADX",
+        "trend": "Trend",
+        "quality_score": "Quality",
+        # NEW columns
+        "stop_loss": "Stop",
+        "shares": "Qty",
+        "position_value": "Position ₹",
+        "target_2R": "Target 2R",
+    },
+    inplace=True,
+)
+
+# Update display columns
+cols = [
+    "Timestamp", "Symbol", "Timeframe", "Quality", "Bias", "Setup", 
+    "LTP", "Stop", "Qty", "Position ₹", "Target 2R",
+    "BBW", "BBW %Rank", "RSI", "ADX", "Trend"
+]
+
 
     df = df.sort_values("signal_time_dt", ascending=False)
     if not audit_mode:
@@ -765,6 +792,33 @@ with st.sidebar:
         st.slider("RSI bear max", 30.0, 50.0, rsi_bear_default, 1.0, key="rsi_bear")
 
     st.slider("15M catch-up candles", 8, 64, 32, 4, key="catchup_candles_15m")
+# Add this in your sidebar, after the existing controls
+st.divider()
+st.subheader("💰 Risk Management")
+account_capital = st.number_input(
+    "Account Capital (₹)",
+    min_value=10000.0,
+    max_value=100000000.0,
+    value=1000000.0,  # Default 10 lakhs
+    step=50000.0,
+    help="Your total trading capital in rupees"
+)
+risk_per_trade = st.slider(
+    "Risk Per Trade (%)",
+    min_value=0.5,
+    max_value=2.0,
+    value=1.0,
+    step=0.1,
+    help="Percentage of capital you're willing to risk on one trade. 1% is recommended."
+)
+atr_multiplier = st.slider(
+    "ATR Multiplier for Stop",
+    min_value=1.5,
+    max_value=3.0,
+    value=2.0,
+    step=0.5,
+    help="How many ATRs away to place stop-loss. 2.0 is standard."
+)
 
 
 # =========================
@@ -1031,13 +1085,69 @@ with st.expander("🔎 Scan & Log (runs every refresh)", expanded=False):
                 key = f"{symbol}|15M|Continuation|{signal_time}|{setup}|{bias}"
 
                 if key not in existing_keys_15m:
-                    quality = compute_quality_score(r)
-                    rows_15m.append([
-                        key, signal_time, logged_at, symbol, "15M", "Continuation",
-                        setup, bias, ltp, bbw, bbw_rank, rsi_val, adx_val, trend,
-                        quality, params_hash
-                    ])
-                    existing_keys_15m.add(key)
+    quality = compute_quality_score(r)
+    
+    # NEW: Create signal dictionary
+    signal_dict = {
+        "key": key,
+        "signal_time": signal_time,
+        "logged_at": logged_at,
+        "symbol": symbol,
+        "timeframe": "15M",
+        "mode": "Continuation",
+        "setup": setup,
+        "bias": bias,
+        "ltp": ltp,
+        "bbw": bbw,
+        "bbw_pct_rank": bbw_rank,
+        "rsi": rsi_val,
+        "adx": adx_val,
+        "trend": trend,
+        "quality_score": quality,
+        "params_hash": params_hash,
+    }
+    
+    # NEW: Add risk metrics
+    enhanced_signal = add_risk_metrics_to_signal(
+        signal_row=signal_dict,
+        df_ohlc=df,
+        account_capital=st.session_state.get("account_capital", 1000000.0),
+        risk_per_trade_pct=st.session_state.get("risk_per_trade", 1.0),
+        atr_multiplier=st.session_state.get("atr_multiplier", 2.0),
+        lookback_swing=20
+    )
+    
+    # Convert to row format for sheets
+    rows_15m.append([
+        enhanced_signal.get("key"),
+        enhanced_signal.get("signal_time"),
+        enhanced_signal.get("logged_at"),
+        enhanced_signal.get("symbol"),
+        enhanced_signal.get("timeframe"),
+        enhanced_signal.get("mode"),
+        enhanced_signal.get("setup"),
+        enhanced_signal.get("bias"),
+        enhanced_signal.get("ltp"),
+        enhanced_signal.get("bbw"),
+        enhanced_signal.get("bbw_pct_rank"),
+        enhanced_signal.get("rsi"),
+        enhanced_signal.get("adx"),
+        enhanced_signal.get("trend"),
+        enhanced_signal.get("quality_score"),
+        enhanced_signal.get("params_hash"),
+        enhanced_signal.get("atr"),
+        enhanced_signal.get("stop_loss"),
+        enhanced_signal.get("stop_method"),
+        enhanced_signal.get("shares"),
+        enhanced_signal.get("position_value"),
+        enhanced_signal.get("rupee_risk"),
+        enhanced_signal.get("risk_pct"),
+        enhanced_signal.get("risk_per_share"),
+        enhanced_signal.get("target_1.5R"),
+        enhanced_signal.get("target_2R"),
+        enhanced_signal.get("target_3R"),
+    ])
+
 
         except Exception as e:
             if st.session_state.get("show_debug", False):
@@ -1074,13 +1184,69 @@ with st.expander("🔎 Scan & Log (runs every refresh)", expanded=False):
                 key = f"{symbol}|Daily|Continuation|{signal_time}|{setup}|{bias}"
 
                 if key not in existing_keys_daily:
-                    quality = compute_quality_score(r)
-                    rows_daily.append([
-                        key, signal_time, logged_at, symbol, "Daily", "Continuation",
-                        setup, bias, ltp, bbw, bbw_rank, rsi_val, adx_val, trend,
-                        quality, params_hash
-                    ])
-                    existing_keys_daily.add(key)
+    quality = compute_quality_score(r)
+    
+    # NEW: Create signal dictionary
+    signal_dict = {
+        "key": key,
+        "signal_time": signal_time,
+        "logged_at": logged_at,
+        "symbol": symbol,
+        "timeframe": "daily",
+        "mode": "Continuation",
+        "setup": setup,
+        "bias": bias,
+        "ltp": ltp,
+        "bbw": bbw,
+        "bbw_pct_rank": bbw_rank,
+        "rsi": rsi_val,
+        "adx": adx_val,
+        "trend": trend,
+        "quality_score": quality,
+        "params_hash": params_hash,
+    }
+    
+    # NEW: Add risk metrics
+    enhanced_signal = add_risk_metrics_to_signal(
+        signal_row=signal_dict,
+        df_ohlc=df,
+        account_capital=st.session_state.get("account_capital", 1000000.0),
+        risk_per_trade_pct=st.session_state.get("risk_per_trade", 1.0),
+        atr_multiplier=st.session_state.get("atr_multiplier", 2.0),
+        lookback_swing=20
+    )
+    
+    # Convert to row format for sheets
+    rows_daily.append([
+        enhanced_signal.get("key"),
+        enhanced_signal.get("signal_time"),
+        enhanced_signal.get("logged_at"),
+        enhanced_signal.get("symbol"),
+        enhanced_signal.get("timeframe"),
+        enhanced_signal.get("mode"),
+        enhanced_signal.get("setup"),
+        enhanced_signal.get("bias"),
+        enhanced_signal.get("ltp"),
+        enhanced_signal.get("bbw"),
+        enhanced_signal.get("bbw_pct_rank"),
+        enhanced_signal.get("rsi"),
+        enhanced_signal.get("adx"),
+        enhanced_signal.get("trend"),
+        enhanced_signal.get("quality_score"),
+        enhanced_signal.get("params_hash"),
+        enhanced_signal.get("atr"),
+        enhanced_signal.get("stop_loss"),
+        enhanced_signal.get("stop_method"),
+        enhanced_signal.get("shares"),
+        enhanced_signal.get("position_value"),
+        enhanced_signal.get("rupee_risk"),
+        enhanced_signal.get("risk_pct"),
+        enhanced_signal.get("risk_per_share"),
+        enhanced_signal.get("target_1.5R"),
+        enhanced_signal.get("target_2R"),
+        enhanced_signal.get("target_3R"),
+    ])
+
 
         except Exception as e:
             if st.session_state.get("show_debug", False):
@@ -1097,4 +1263,5 @@ with st.expander("🔎 Scan & Log (runs every refresh)", expanded=False):
     st.caption(f"Logged **{appended_15m}** new 15M + **{appended_daily}** Daily signals.")
 
 st.caption("✅ No Streamlit ternary rendering anywhere = no more DeltaGenerator dumps.")
+
 
