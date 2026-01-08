@@ -534,13 +534,13 @@ cols = [
 ]
 
 
-df = df.sort_values("signal_time_dt", ascending=False)
-    if not audit_mode:
-        df = df.drop_duplicates(subset=["Symbol", "Timeframe"], keep="first")
+        df = df.sort_values("signal_time_dt", ascending=False)
+            if not audit_mode:
+            df = df.drop_duplicates(subset=["Symbol", "Timeframe"], keep="first")
 
-    cols = ["Timestamp", "Symbol", "Timeframe", "Quality", "Bias", "Setup", "LTP", "BBW", "BBW %Rank", "RSI", "ADX", "Trend"]
-    for c in cols:
-        if c not in df.columns:
+        cols = ["Timestamp", "Symbol", "Timeframe", "Quality", "Bias", "Setup", "LTP", "BBW", "BBW %Rank", "RSI", "ADX", "Trend"]
+        for c in cols:
+           if c not in df.columns:
             df[c] = None
     return df[cols]
 
@@ -1263,6 +1263,7 @@ with st.expander("🔎 Scan & Log (runs every refresh)", expanded=False):
     st.caption(f"Logged **{appended_15m}** new 15M + **{appended_daily}** Daily signals.")
 
 st.caption("✅ No Streamlit ternary rendering anywhere = no more DeltaGenerator dumps.")
+
 
 
 
