@@ -9,7 +9,12 @@ import inspect
 import numpy as np
 import pandas as pd
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
+
+# Autorefresh (optional dependency)
+try:
+    from streamlit_autorefresh import st_autorefresh
+except Exception:
+    st_autorefresh = None
 
 import gspread
 from gspread.exceptions import SpreadsheetNotFound, APIError
@@ -32,7 +37,8 @@ from utils.strategy import prepare_trend_squeeze
 # Streamlit config (ONLY ONCE)
 # =========================
 st.set_page_config(page_title="📉 Trend Squeeze Screener", layout="wide")
-st_autorefresh(interval=300000, key="auto_refresh")  # 5 min refresh
+if st_autorefresh:
+    st_autorefresh(interval=300000, key="auto_refresh")  # 5 min refresh
 
 IST = ZoneInfo("Asia/Kolkata")
 MARKET_OPEN = dtime(9, 15)
@@ -45,7 +51,7 @@ MARKET_CLOSE_TOL = dtime(15, 45)
 SIGNAL_SHEET_15M = "TrendSqueezeSignals_15M"
 SIGNAL_SHEET_DAILY = "TrendSqueezeSignals_Daily"
 
-# Direct Sheet IDs (signals logs)
+# Allow overriding from secrets; fallback to your existing IDs
 SHEET_ID_15M = st.secrets.get("SHEET_ID_15M", "1RP2tbh6WnMgEDAv5FWXD6GhePXno9bZ81ILFyoX6Fb8")
 SHEET_ID_DAILY = st.secrets.get("SHEET_ID_DAILY", "1u-W5vu3KM6XPRr78o8yyK8pPaAjRUIFEEYKHyYGUsM0")
 
@@ -89,7 +95,7 @@ FYERS_TOKEN_HEADERS = [
 
 
 # =========================
-# Time helpers (IST)
+# Helpers
 # =========================
 def now_ist() -> datetime:
     return datetime.now(IST)
@@ -145,6 +151,7 @@ def normalize_ohlc_index_to_ist(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     idx = out.index
 
+    # tz-aware -> safe convert
     if getattr(idx, "tz", None) is not None:
         try:
             out.index = idx.tz_convert("Asia/Kolkata").tz_localize(None)
@@ -152,6 +159,7 @@ def normalize_ohlc_index_to_ist(df: pd.DataFrame) -> pd.DataFrame:
             pass
         return out
 
+    # tz-naive -> attempt UTC->IST
     try:
         idx_utc_to_ist = idx.tz_localize("UTC").tz_convert("Asia/Kolkata").tz_localize(None)
     except Exception:
@@ -168,6 +176,18 @@ def normalize_ohlc_index_to_ist(df: pd.DataFrame) -> pd.DataFrame:
         out.index = idx_utc_to_ist
 
     return out
+
+
+def clean_cell(v):
+    """Sheets-friendly values (avoid NaN/inf/None surprises)."""
+    if v is None:
+        return ""
+    try:
+        if isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
+            return ""
+    except Exception:
+        pass
+    return v
 
 
 # =========================
@@ -236,13 +256,19 @@ def get_fyers_token_worksheet():
 
     return ws, None
 
+
 def read_fyers_row(ws):
+    """
+    Robust read:
+    - uses first non-empty record row (not blindly records[0])
+    - always falls back to A2:D2 if records are empty or useless
+    """
     try:
         records = ws.get_all_records()
     except Exception:
         records = []
 
-    # Pick first row that has at least app_id OR token
+    # Find first meaningful row
     for row in records:
         if not isinstance(row, dict):
             continue
@@ -250,10 +276,10 @@ def read_fyers_row(ws):
         secret_id = (row.get("fyers_secret_id") or "").strip()
         token = (row.get("fyers_access_token") or "").strip()
         updated_at = (row.get("fyers_token_updated_at") or "").strip()
-        if app_id or token:
+        if app_id or token or secret_id:
             return app_id, secret_id, token, updated_at
 
-    # Fallback cells (forces row2 even if records exist but are empty)
+    # Fallback fixed cells
     try:
         app_id = (ws.acell("A2").value or "").strip()
         secret_id = (ws.acell("B2").value or "").strip()
@@ -262,7 +288,6 @@ def read_fyers_row(ws):
         return app_id, secret_id, token, updated_at
     except Exception:
         return "", "", "", ""
-
 
 
 def ensure_fyers_row_exists(ws):
@@ -317,6 +342,9 @@ def exchange_auth_code_for_token(app_id: str, secret_id: str, redirect_uri: str,
 
 @st.cache_data(ttl=120, show_spinner=False)
 def fyers_smoke_test() -> tuple[bool, str]:
+    """
+    Health check: tries OHLC fetch.
+    """
     try:
         df = get_ohlc_15min("RELIANCE", days_back=7)
         df = normalize_ohlc_index_to_ist(df)
@@ -324,7 +352,7 @@ def fyers_smoke_test() -> tuple[bool, str]:
             return True, "OK"
         return False, "OHLC returned empty/too short"
     except Exception as e:
-        return False, str(e)[:200]
+        return False, f"{type(e).__name__}: {str(e)[:180]}"
 
 
 # =========================
@@ -352,7 +380,7 @@ def get_signals_worksheet(sheet_name: str):
     except Exception as e:
         return None, f"Failed to access sheet1: {e}"
 
-    # Enforce headers (order matters because we append rows in this order)
+    # Enforce exact header order (critical for append_rows correctness)
     try:
         header = ws.row_values(1)
         if header != SIGNAL_COLUMNS:
@@ -629,6 +657,14 @@ with st.sidebar:
 
     app_id_sheet, secret_id_sheet, token_sheet, updated_at_sheet = read_fyers_row(ws_fyers)
 
+    # Non-leaky debug
+    st.caption(
+        f"Sheet read → app_id={'OK' if app_id_sheet else 'EMPTY'} • "
+        f"secret={'OK' if secret_id_sheet else 'EMPTY'} • "
+        f"token_len={len(token_sheet) if token_sheet else 0} • "
+        f"updated_at={updated_at_sheet or 'N/A'}"
+    )
+
     if token_sheet:
         st.success("Token found ✅")
     else:
@@ -650,6 +686,7 @@ with st.sidebar:
         st.error(f"Login URL failed: {e}")
 
     auth_code = st.text_input("2) Paste auth_code", value="", key="auth_code_input")
+
     if st.button("3) Exchange & Save Token", type="primary", key="exchange_save_btn"):
         if not auth_code.strip():
             st.error("Paste auth_code first.")
@@ -665,15 +702,27 @@ with st.sidebar:
                 st.error(f"Token exchange failed: {e}")
 
     st.divider()
+
     st.subheader("⚙️ View settings")
     st.checkbox("Show debug", value=False, key="show_debug")
     st.checkbox("Audit mode (no de-dup)", value=False, key="audit_mode")
     st.slider("Retention (hours)", 6, 48, 24, 6, key="retention_hours")
 
-    st.radio("Show quality", ["A only", "A + B", "A + B + C"], index=0, key="quality_pref", horizontal=True)
+    st.radio(
+        "Show quality",
+        ["A only", "A + B", "A + B + C"],
+        index=0,
+        key="quality_pref",
+        horizontal=True,
+    )
 
     with st.expander("🧨 Breakout confirmation", expanded=False):
-        st.radio("Signal type", ["✅ Breakout Confirmed (trade)", "🟡 Setup Forming (watchlist)"], index=0, key="signal_mode")
+        st.radio(
+            "Signal type",
+            ["✅ Breakout Confirmed (trade)", "🟡 Setup Forming (watchlist)"],
+            index=0,
+            key="signal_mode",
+        )
         st.slider("Consolidation lookback (candles)", 10, 60, 20, 5, key="breakout_lookback")
         st.checkbox("Require BBW expansion", value=True, key="require_bbw_expansion")
         st.checkbox("Require volume spike", value=False, key="require_volume_spike")
@@ -681,7 +730,12 @@ with st.sidebar:
 
     with st.expander("🧩 Engine controls", expanded=False):
         if _HAS_ENGINE:
-            st.selectbox("Engine", ["Hybrid (recommended)", "Box Breakout (range)", "Squeeze Breakout (TTM)"], index=0, key="engine_ui")
+            st.selectbox(
+                "Engine",
+                ["Hybrid (recommended)", "Box Breakout (range)", "Squeeze Breakout (TTM)"],
+                index=0,
+                key="engine_ui",
+            )
         else:
             st.info("Engine controls not available in your strategy.py.")
 
@@ -697,6 +751,7 @@ with st.sidebar:
 
     with st.expander("📈 Threshold profiles", expanded=False):
         param_profile = st.selectbox("Profile", ["Normal", "Conservative", "Aggressive"], index=0, key="param_profile")
+
         if param_profile == "Conservative":
             bbw_abs_default, bbw_pct_default = 0.035, 0.25
             adx_default, rsi_bull_default, rsi_bear_default = 25.0, 60.0, 40.0
@@ -729,11 +784,6 @@ fyers_ok = False
 fyers_health_ok = False
 fyers_health_msg = "Not checked"
 
-ws_fyers, ws_fyers_err = get_fyers_token_worksheet()
-app_id_sheet, secret_id_sheet, token_sheet, updated_at_sheet = ("", "", "", "")
-if not ws_fyers_err and ws_fyers:
-    app_id_sheet, secret_id_sheet, token_sheet, updated_at_sheet = read_fyers_row(ws_fyers)
-
 if token_sheet:
     try:
         init_fyers_session(app_id_sheet, token_sheet)
@@ -742,11 +792,11 @@ if token_sheet:
     except Exception as e:
         fyers_ok = False
         fyers_health_ok = False
-        fyers_health_msg = str(e)[:220]
+        fyers_health_msg = f"{type(e).__name__}: {str(e)[:220]}"
 else:
     fyers_ok = False
     fyers_health_ok = False
-    fyers_health_msg = "No token yet. Use the sidebar login flow."
+    fyers_health_msg = "No token yet. Use sidebar login flow."
 
 
 # =========================
@@ -765,7 +815,7 @@ if fyers_ok and fyers_health_ok:
 elif fyers_ok and not fyers_health_ok:
     st.warning(f"⚠️ FYERS session set but data fetch failing: {fyers_health_msg}")
 else:
-    st.error("🔴 FYERS not initialized (no valid token). Use the sidebar login flow.")
+    st.error(f"🔴 FYERS not initialized: {fyers_health_msg}")
     st.stop()
 
 
@@ -789,6 +839,11 @@ use_setup_col_local = "setup" if st.session_state.get("signal_mode", "✅").star
 # =========================
 ws_15m, ws_15m_err = get_signals_worksheet(SIGNAL_SHEET_15M)
 ws_daily, ws_daily_err = get_signals_worksheet(SIGNAL_SHEET_DAILY)
+
+if ws_15m_err:
+    st.warning(f"15M sheet issue: {ws_15m_err}")
+if ws_daily_err:
+    st.warning(f"Daily sheet issue: {ws_daily_err}")
 
 
 # =========================
@@ -819,20 +874,35 @@ with st.expander("🧹 One-time repair: convert non-IST timestamps in Sheets", e
 top_row = st.columns([2, 2, 3])
 with top_row[0]:
     st.write("**15M Sheet**")
-    st.success("Connected ✅" if not ws_15m_err else "Not connected ❌")
     if ws_15m_err:
+        st.error("Not connected ❌")
         st.caption(ws_15m_err)
+    else:
+        st.success("Connected ✅")
 with top_row[1]:
     st.write("**Daily Sheet**")
-    st.success("Connected ✅" if not ws_daily_err else "Not connected ❌")
     if ws_daily_err:
+        st.error("Not connected ❌")
         st.caption(ws_daily_err)
+    else:
+        st.success("Connected ✅")
 with top_row[2]:
     st.write("**Display**")
     st.caption("Quality filter + de-dup are in the sidebar.")
 
-df_recent_15m = load_recent_signals(ws_15m, st.session_state["retention_hours"], "15M", audit_mode=st.session_state["audit_mode"]) if ws_15m and not ws_15m_err else pd.DataFrame()
-df_recent_daily = load_recent_signals(ws_daily, st.session_state["retention_hours"], "Daily", audit_mode=st.session_state["audit_mode"]) if ws_daily and not ws_daily_err else pd.DataFrame()
+df_recent_15m = load_recent_signals(
+    ws_15m,
+    st.session_state["retention_hours"],
+    "15M",
+    audit_mode=st.session_state["audit_mode"],
+) if ws_15m and not ws_15m_err else pd.DataFrame()
+
+df_recent_daily = load_recent_signals(
+    ws_daily,
+    st.session_state["retention_hours"],
+    "Daily",
+    audit_mode=st.session_state["audit_mode"],
+) if ws_daily and not ws_daily_err else pd.DataFrame()
 
 st.subheader("🧠 Recent Signals (Market-Aware)")
 
@@ -851,11 +921,17 @@ c1, c2 = st.columns(2)
 with c1:
     st.markdown("### 15M")
     dfA_15m = _filter_quality(df_recent_15m)
-    st.dataframe(dfA_15m, use_container_width=True) if not dfA_15m.empty else st.info("No signals in window.")
+    if not dfA_15m.empty:
+        st.dataframe(dfA_15m, use_container_width=True)
+    else:
+        st.info("No signals in window.")
 with c2:
     st.markdown("### Daily")
     dfA_daily = _filter_quality(df_recent_daily)
-    st.dataframe(dfA_daily, use_container_width=True) if not dfA_daily.empty else st.info("No signals in window.")
+    if not dfA_daily.empty:
+        st.dataframe(dfA_daily, use_container_width=True)
+    else:
+        st.info("No signals in window.")
 
 st.divider()
 
@@ -864,6 +940,9 @@ st.divider()
 # Scan + logging
 # =========================
 with st.expander("🔎 Scan & Log (runs every refresh)", expanded=False):
+    if ws_15m_err or ws_daily_err:
+        st.warning("Sheets not fully connected; scanning will still run, but logging may fail.")
+
     existing_keys_15m = fetch_existing_keys_recent(ws_15m, days_back=3) if ws_15m and not ws_15m_err else set()
     existing_keys_daily = fetch_existing_keys_recent(ws_daily, days_back=7) if ws_daily and not ws_daily_err else set()
 
@@ -908,13 +987,18 @@ with st.expander("🔎 Scan & Log (runs every refresh)", expanded=False):
 
         return kwargs
 
+    def row_from_signal(enhanced_signal: dict) -> list:
+        return [clean_cell(enhanced_signal.get(c, "")) for c in SIGNAL_COLUMNS]
+
     # 15M scan
     for symbol in stock_list:
         try:
-            df = normalize_ohlc_index_to_ist(get_ohlc_15min(symbol, days_back=15))
+            df = get_ohlc_15min(symbol, days_back=15)
+            df = normalize_ohlc_index_to_ist(df)
             if df is None or df.shape[0] < 220:
                 continue
 
+            # Future-candle guard
             if pd.Timestamp(df.index[-1]) > now_ist().replace(tzinfo=None) + timedelta(minutes=3):
                 if st.session_state.get("show_debug", False):
                     st.warning(f"{symbol}: OHLC last candle looks future, skipping.")
@@ -975,18 +1059,19 @@ with st.expander("🔎 Scan & Log (runs every refresh)", expanded=False):
                     lookback_swing=20,
                 )
 
-                rows_15m.append([enhanced_signal.get(c) for c in SIGNAL_COLUMNS])
+                rows_15m.append(row_from_signal(enhanced_signal))
                 existing_keys_15m.add(key)
 
         except Exception as e:
             if st.session_state.get("show_debug", False):
-                st.warning(f"{symbol} 15M error: {e}")
+                st.warning(f"{symbol} 15M error: {type(e).__name__}: {e}")
             continue
 
     # Daily scan
     for symbol in stock_list:
         try:
-            df_daily = normalize_ohlc_index_to_ist(get_ohlc_daily(symbol, lookback_days=252))
+            df_daily = get_ohlc_daily(symbol, lookback_days=252)
+            df_daily = normalize_ohlc_index_to_ist(df_daily)
             if df_daily is None or df_daily.shape[0] < 100:
                 continue
 
@@ -1044,23 +1129,23 @@ with st.expander("🔎 Scan & Log (runs every refresh)", expanded=False):
                     lookback_swing=20,
                 )
 
-                rows_daily.append([enhanced_signal.get(c) for c in SIGNAL_COLUMNS])
+                rows_daily.append(row_from_signal(enhanced_signal))
                 existing_keys_daily.add(key)
 
         except Exception as e:
             if st.session_state.get("show_debug", False):
-                st.warning(f"{symbol} Daily error: {e}")
+                st.warning(f"{symbol} Daily error: {type(e).__name__}: {e}")
             continue
 
     appended_15m = appended_daily = 0
     err15 = errd = None
+
     if ws_15m and not ws_15m_err:
         appended_15m, err15 = append_signals(ws_15m, rows_15m, st.session_state.get("show_debug", False))
     if ws_daily and not ws_daily_err:
         appended_daily, errd = append_signals(ws_daily, rows_daily, st.session_state.get("show_debug", False))
 
     if err15 or errd:
-        st.error(f"Logging errors: 15M={err15} | Daily={errd}")
+        st.error(f"Logging errors → 15M={err15} | Daily={errd}")
 
     st.caption(f"Logged **{appended_15m}** new 15M + **{appended_daily}** Daily signals.")
-
