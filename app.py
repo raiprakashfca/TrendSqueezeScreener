@@ -236,22 +236,24 @@ def get_fyers_token_worksheet():
 
     return ws, None
 
-
 def read_fyers_row(ws):
     try:
         records = ws.get_all_records()
     except Exception:
         records = []
 
-    if records:
-        row = records[0]
+    # Pick first row that has at least app_id OR token
+    for row in records:
+        if not isinstance(row, dict):
+            continue
         app_id = (row.get("fyers_app_id") or "").strip()
         secret_id = (row.get("fyers_secret_id") or "").strip()
         token = (row.get("fyers_access_token") or "").strip()
         updated_at = (row.get("fyers_token_updated_at") or "").strip()
-        return app_id, secret_id, token, updated_at
+        if app_id or token:
+            return app_id, secret_id, token, updated_at
 
-    # Fallback cells
+    # Fallback cells (forces row2 even if records exist but are empty)
     try:
         app_id = (ws.acell("A2").value or "").strip()
         secret_id = (ws.acell("B2").value or "").strip()
@@ -260,6 +262,7 @@ def read_fyers_row(ws):
         return app_id, secret_id, token, updated_at
     except Exception:
         return "", "", "", ""
+
 
 
 def ensure_fyers_row_exists(ws):
@@ -1060,3 +1063,4 @@ with st.expander("🔎 Scan & Log (runs every refresh)", expanded=False):
         st.error(f"Logging errors: 15M={err15} | Daily={errd}")
 
     st.caption(f"Logged **{appended_15m}** new 15M + **{appended_daily}** Daily signals.")
+
