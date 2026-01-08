@@ -534,7 +534,7 @@ cols = [
 ]
 
 
-    df = df.sort_values("signal_time_dt", ascending=False)
+df = df.sort_values("signal_time_dt", ascending=False)
     if not audit_mode:
         df = df.drop_duplicates(subset=["Symbol", "Timeframe"], keep="first")
 
@@ -1263,5 +1263,6 @@ with st.expander("🔎 Scan & Log (runs every refresh)", expanded=False):
     st.caption(f"Logged **{appended_15m}** new 15M + **{appended_daily}** Daily signals.")
 
 st.caption("✅ No Streamlit ternary rendering anywhere = no more DeltaGenerator dumps.")
+
 
 
