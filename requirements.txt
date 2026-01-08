@@ -1,24 +1,16 @@
 streamlit
 pandas
-ta
-kiteconnect
+numpy
 gspread
-oauth2client
-openpyxl
+google-auth
 requests
 streamlit-autorefresh
-fyers-apiv3
 fyers-apiv3==3.1.7
 
 # Optional charting
-matplotlib
 plotly
-
-# Optional PDF generation
-fpdf
-pdfkit
-
-# Optional UI enhancements
+matplotlib
+kiteconnect
+openpyxl
 streamlit-option-menu
-
-
+fpdf
