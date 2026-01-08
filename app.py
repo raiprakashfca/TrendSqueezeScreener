@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
+from utils.zerodha_utils
 
 from utils.risk_calculator import add_risk_metrics_to_signal
 
@@ -1263,3 +1264,4 @@ with st.expander("🔎 Scan & Log (runs every refresh)", expanded=False):
     st.caption(f"Logged **{appended_15m}** new 15M + **{appended_daily}** Daily signals.")
 
 st.caption("✅ Step 1 Complete: Position sizing & stop-loss calculation integrated!")
+
